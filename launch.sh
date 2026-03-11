@@ -1,7 +1,61 @@
 #!/bin/bash
 
 # Solana Token Account Closer Launcher
-# This script launches the Python GUI application
+# This script launches the application in either GUI or Web mode
+
+show_help() {
+    echo "Solana Token Account Closer"
+    echo ""
+    echo "Usage: ./launch.sh [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --web, -w       Launch web interface only (opens in browser)"
+    echo "  --both, -b      Launch both desktop GUI and web interface"
+    echo "  --port, -p      Port for web interface (default: 8080)"
+    echo "  --no-browser    Do not automatically open browser"
+    echo "  --help, -h      Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  ./launch.sh              # Launch desktop GUI only"
+    echo "  ./launch.sh --web        # Launch web interface only"
+    echo "  ./launch.sh --both       # Launch both GUI and web"
+    echo "  ./launch.sh -b -p 3000   # Both interfaces, web on port 3000"
+}
+
+# Parse arguments
+MODE_ARG=""
+PORT_ARG=""
+NO_BROWSER=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --web|-w)
+            MODE_ARG="--web"
+            shift
+            ;;
+        --both|-b)
+            MODE_ARG="--both"
+            shift
+            ;;
+        --port|-p)
+            PORT_ARG="--port $2"
+            shift 2
+            ;;
+        --no-browser)
+            NO_BROWSER="--no-browser"
+            shift
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
 
 echo "🚀 Launching Solana Token Account Closer..."
 
@@ -21,17 +75,24 @@ if ! command -v spl-token &> /dev/null; then
 fi
 
 # Check if the main Python file exists
-if [ ! -f "token_closer.py" ]; then
-    echo "❌ Error: token_closer.py not found in current directory"
-    echo "Please run this script from the project directory"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$SCRIPT_DIR/token_closer.py" ]; then
+    echo "❌ Error: token_closer.py not found in script directory"
     exit 1
 fi
 
 echo "✅ Python 3 found: $(python3 --version)"
 echo "✅ spl-token found: $(spl-token --version)"
-echo "✅ Starting application..."
+
+if [ "$MODE_ARG" = "--both" ]; then
+    echo "✅ Starting desktop GUI and web interface..."
+elif [ "$MODE_ARG" = "--web" ]; then
+    echo "✅ Starting web interface..."
+else
+    echo "✅ Starting desktop GUI..."
+fi
 
 # Launch the application
-python3 token_closer.py
+python3 "$SCRIPT_DIR/token_closer.py" $MODE_ARG $PORT_ARG $NO_BROWSER
 
 echo "👋 Application closed" 

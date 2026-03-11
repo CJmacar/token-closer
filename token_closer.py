@@ -1843,6 +1843,8 @@ class WebInterface:
             return addr;
         }
         
+        let metadataFetchInProgress = false;
+        
         async function refreshAccounts() {
             log('Refreshing token accounts...', 'info');
             document.getElementById('accounts-table').innerHTML = '<tr><td colspan="7"><div class="loading"><div class="spinner"></div><span>Loading accounts...</span></div></td></tr>';
@@ -1855,6 +1857,11 @@ class WebInterface:
                     renderAccounts();
                     log('Found ' + accounts.length + ' token accounts', 'success');
                     showToast('Loaded ' + accounts.length + ' accounts', 'success');
+                    
+                    if (data.missing_metadata > 0) {
+                        log('Fetching metadata for ' + data.missing_metadata + ' tokens...', 'info');
+                        fetchMetadataInBackground();
+                    }
                 } else {
                     log('Error: ' + data.error, 'error');
                     showToast('Failed to load accounts', 'error');
@@ -1862,6 +1869,38 @@ class WebInterface:
             } catch (err) {
                 log('Error: ' + err.message, 'error');
                 showToast('Connection error', 'error');
+            }
+        }
+        
+        async function fetchMetadataInBackground() {
+            if (metadataFetchInProgress) return;
+            metadataFetchInProgress = true;
+            
+            try {
+                while (true) {
+                    const response = await fetch('/api/metadata');
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        accounts = data.accounts;
+                        renderAccounts();
+                        
+                        if (data.remaining === 0) {
+                            if (data.fetched > 0) {
+                                log('Metadata loading complete', 'success');
+                            }
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                    
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            } catch (err) {
+                log('Metadata fetch error: ' + err.message, 'warning');
+            } finally {
+                metadataFetchInProgress = false;
             }
         }
         
@@ -2043,8 +2082,8 @@ class WebInterface:
         self._lock = threading.Lock()
         self.server: Optional[HTTPServer] = None
     
-    def start(self) -> None:
-        """Start the web server and open browser."""
+    def start(self, open_browser: bool = True) -> None:
+        """Start the web server (blocking) and optionally open browser."""
         self._load_metadata()
         
         handler = self._create_handler()
@@ -2057,12 +2096,40 @@ class WebInterface:
         print(f"\n  Server running at: {url}")
         print(f"  Press Ctrl+C to stop\n")
         
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        if open_browser:
+            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
         
         try:
             self.server.serve_forever()
         except KeyboardInterrupt:
             print("\nShutting down...")
+            self.server.shutdown()
+    
+    def start_background(self, open_browser: bool = True) -> None:
+        """Start the web server in a background thread."""
+        self._load_metadata()
+        
+        handler = self._create_handler()
+        self.server = HTTPServer(('127.0.0.1', self.port), handler)
+        
+        url = f"http://127.0.0.1:{self.port}"
+        print(f"\n  Web interface also available at: {url}")
+        
+        def serve():
+            try:
+                self.server.serve_forever()
+            except Exception:
+                pass
+        
+        self._server_thread = threading.Thread(target=serve, daemon=True)
+        self._server_thread.start()
+        
+        if open_browser:
+            threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    
+    def stop(self) -> None:
+        """Stop the web server."""
+        if self.server:
             self.server.shutdown()
     
     def _load_metadata(self) -> None:
@@ -2086,7 +2153,7 @@ class WebInterface:
             print(f"  Warning: {result['message']}")
     
     def _fetch_accounts(self) -> Tuple[bool, str]:
-        """Fetch token accounts."""
+        """Fetch token accounts (without blocking on metadata)."""
         result = CommandExecutor.run(['spl-token', 'accounts', '--output', 'json'])
         
         if not result.success:
@@ -2096,18 +2163,31 @@ class WebInterface:
             data = json.loads(result.output)
             accounts = [TokenAccount.from_json(a) for a in data.get('accounts', [])]
             
-            mints = {a.mint for a in accounts}
-            missing = [m for m in mints if not self.metadata_service.has(m)]
-            if missing:
-                def progress(c, t): pass
-                self.metadata_service.fetch_missing(set(missing), progress)
-            
             with self._lock:
                 self.accounts = accounts
             
             return True, ""
         except json.JSONDecodeError as e:
             return False, str(e)
+    
+    def _get_missing_mints(self) -> List[str]:
+        """Get list of mints without metadata."""
+        with self._lock:
+            return [a.mint for a in self.accounts if not self.metadata_service.has(a.mint)]
+    
+    def _fetch_metadata_batch(self, mints: List[str], batch_size: int = 5) -> int:
+        """Fetch metadata for a batch of mints. Returns count fetched."""
+        to_fetch = [m for m in mints[:batch_size] if SecurityUtils.is_valid_solana_address(m)]
+        fetched = 0
+        
+        for mint in to_fetch:
+            metadata = self.metadata_service.fetch_from_cli(mint) or \
+                       self.metadata_service.fetch_from_dexscreener(mint)
+            if metadata:
+                self.metadata_service.set(mint, metadata)
+                fetched += 1
+        
+        return fetched
     
     def _get_accounts_json(self) -> List[dict]:
         """Get accounts as JSON-serializable list."""
@@ -2257,12 +2337,30 @@ class WebInterface:
                 elif parsed.path == '/api/accounts':
                     success, error = web_interface._fetch_accounts()
                     if success:
+                        missing = web_interface._get_missing_mints()
                         self.send_json({
                             'success': True,
-                            'accounts': web_interface._get_accounts_json()
+                            'accounts': web_interface._get_accounts_json(),
+                            'missing_metadata': len(missing)
                         })
                     else:
                         self.send_json({'success': False, 'error': error}, 500)
+                
+                elif parsed.path == '/api/metadata':
+                    missing = web_interface._get_missing_mints()
+                    if missing:
+                        fetched = web_interface._fetch_metadata_batch(missing, batch_size=3)
+                        remaining = len(missing) - fetched
+                    else:
+                        fetched = 0
+                        remaining = 0
+                    
+                    self.send_json({
+                        'success': True,
+                        'accounts': web_interface._get_accounts_json(),
+                        'fetched': fetched,
+                        'remaining': remaining
+                    })
                 
                 else:
                     self.send_response(404)
@@ -2320,10 +2418,20 @@ def main():
         help='Launch web interface instead of desktop GUI'
     )
     parser.add_argument(
+        '--both', '-b',
+        action='store_true',
+        help='Launch both desktop GUI and web interface simultaneously'
+    )
+    parser.add_argument(
         '--port', '-p',
         type=int,
         default=8080,
         help='Port for web interface (default: 8080)'
+    )
+    parser.add_argument(
+        '--no-browser',
+        action='store_true',
+        help='Do not automatically open browser (web mode only)'
     )
     
     args = parser.parse_args()
@@ -2335,12 +2443,38 @@ def main():
         print('  sh -c "$(curl -sSfL https://release.solana.com/stable/install)"')
         return
     
-    if args.web:
-        # Web interface
-        web = WebInterface(port=args.port)
-        web.start()
+    web_server = None
+    
+    if args.both:
+        # Run both interfaces
+        if not TKINTER_AVAILABLE:
+            print("\n❌ Error: tkinter not available for desktop GUI.")
+            print("Use --web flag for web interface only.")
+            return
+        
+        # Start web server in background thread
+        web_server = WebInterface(port=args.port)
+        web_server.start_background(open_browser=not args.no_browser)
+        
+        # Run desktop GUI in main thread
+        root = tk.Tk()
+        app = TokenAccountCloser(root)
+        
+        def on_close():
+            if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
+                if web_server:
+                    web_server.stop()
+                root.destroy()
+        
+        root.protocol("WM_DELETE_WINDOW", on_close)
+        root.mainloop()
+        
+    elif args.web:
+        # Web interface only
+        web_server = WebInterface(port=args.port)
+        web_server.start(open_browser=not args.no_browser)
     else:
-        # Desktop GUI (requires tkinter)
+        # Desktop GUI only
         if not TKINTER_AVAILABLE:
             print("\n❌ Error: tkinter not available.")
             print("Use --web flag for web interface instead:")
