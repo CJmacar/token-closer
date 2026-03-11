@@ -1,1034 +1,1046 @@
 #!/usr/bin/env python3
 """
 Solana Token Account Closer
-A simple GUI application to close Solana token accounts using spl-token CLI.
-Optimizes for cost by allowing batch selection and closing of multiple accounts.
+A GUI application to close Solana token accounts and recover rent.
+
+Security: Input validation, shell sanitization, secure temp files
+Architecture: Separated concerns with dataclasses and type hints
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-import subprocess
+from __future__ import annotations
+
 import json
-import threading
-from typing import List, Dict, Optional
 import os
-import tempfile
 import re
 import shlex
-import urllib.request
+import subprocess
+import tempfile
+import threading
 import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Set, Tuple
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
 
-class TokenAccountCloser:
-    # Valid Solana address pattern: Base58 characters, 32-44 chars long
+
+# =============================================================================
+# Constants & Configuration
+# =============================================================================
+
+class Config:
+    """Application configuration constants."""
+    APP_NAME = "Solana Token Account Closer"
+    APP_VERSION = "1.1.0"
+    WINDOW_SIZE = "1150x750"
+    
+    # Solana address validation: Base58, 32-44 characters
     SOLANA_ADDRESS_PATTERN = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
     
-    # Token list API URLs (tried in order - GitHub first as most accessible)
+    # API endpoints (tried in order)
     TOKEN_LIST_URLS = [
         "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json",
         "https://cdn.jsdelivr.net/gh/solana-labs/token-list@main/src/tokens/solana.tokenlist.json",
         "https://token.jup.ag/all",
     ]
     
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Solana Token Account Closer")
-        self.root.geometry("1100x700")  # Wider to accommodate new columns
-        self.root.configure(bg='#f0f0f0')
-        
-        # Data storage with thread lock for safety
-        self._lock = threading.Lock()
-        self.token_accounts = []
-        self.selected_accounts = set()
-        
-        # Token metadata cache: mint -> {name, symbol, description}
-        self.token_metadata_cache = {}
-        self.metadata_loading = False
-        
-        # Create UI
-        self.create_widgets()
-        
-        # Load token metadata in background
-        self.load_token_metadata()
-        
-        # Load accounts on startup
-        self.refresh_accounts()
+    # Timeouts (seconds)
+    API_TIMEOUT = 15
+    CLI_TIMEOUT = 30
+    METADATA_FETCH_TIMEOUT = 10
+    
+    # Rent estimate for token accounts (SOL)
+    TOKEN_ACCOUNT_RENT = 0.00203928
+    TX_FEE = 0.000005
+    
+    # Rate limiting
+    API_RATE_LIMIT_DELAY = 0.1  # seconds between API calls
+
+
+class LogLevel(Enum):
+    """Log message severity levels."""
+    INFO = ("black", "INFO")
+    SUCCESS = ("green", "SUCCESS")
+    WARNING = ("orange", "WARNING")
+    ERROR = ("red", "ERROR")
+
+
+# =============================================================================
+# Data Models
+# =============================================================================
+
+@dataclass
+class TokenMetadata:
+    """Token metadata information."""
+    name: str = ""
+    symbol: str = ""
+    description: str = ""
+    
+    @property
+    def display_name(self) -> str:
+        return self.name or "—"
+    
+    @property
+    def display_symbol(self) -> str:
+        return self.symbol or "—"
+
+
+@dataclass
+class TokenAccount:
+    """Represents a Solana token account."""
+    address: str
+    mint: str
+    balance: str
+    decimals: int
+    owner: str
+    is_native: bool = False
     
     @classmethod
-    def is_valid_solana_address(cls, address: str) -> bool:
-        """Validate that an address matches Solana's Base58 format"""
+    def from_json(cls, data: dict) -> TokenAccount:
+        """Create TokenAccount from JSON data."""
+        token_amount = data.get('tokenAmount', {})
+        return cls(
+            address=data.get('address', ''),
+            mint=data.get('mint', ''),
+            balance=token_amount.get('uiAmountString', '0'),
+            decimals=token_amount.get('decimals', 0),
+            owner=data.get('owner', ''),
+            is_native=data.get('isNative', False),
+        )
+    
+    @property
+    def display_address(self) -> str:
+        """Truncated address for display."""
+        if len(self.address) > 20:
+            return f"{self.address[:8]}...{self.address[-6:]}"
+        return self.address
+    
+    @property
+    def display_mint(self) -> str:
+        """Truncated mint for display."""
+        if len(self.mint) > 20:
+            return f"{self.mint[:8]}...{self.mint[-6:]}"
+        return self.mint
+
+
+@dataclass
+class OperationResult:
+    """Result of a command operation."""
+    success: bool
+    output: str = ""
+    error: str = ""
+
+
+# =============================================================================
+# Security Utilities
+# =============================================================================
+
+class SecurityUtils:
+    """Security-related utility functions."""
+    
+    @staticmethod
+    def is_valid_solana_address(address: str) -> bool:
+        """Validate Solana address format."""
         if not address or not isinstance(address, str):
             return False
-        return bool(cls.SOLANA_ADDRESS_PATTERN.match(address))
+        return bool(Config.SOLANA_ADDRESS_PATTERN.match(address))
     
     @staticmethod
     def sanitize_for_shell(value: str) -> str:
-        """Sanitize a value for safe use in shell commands"""
+        """Safely escape value for shell commands."""
         return shlex.quote(value)
     
-    def load_token_metadata(self):
-        """Load token metadata from token list APIs (tries multiple sources)"""
-        if self.metadata_loading:
+    @staticmethod
+    def validate_addresses(addresses: List[str]) -> Tuple[List[str], List[str]]:
+        """Validate a list of addresses, return (valid, invalid)."""
+        valid = []
+        invalid = []
+        for addr in addresses:
+            if SecurityUtils.is_valid_solana_address(addr):
+                valid.append(addr)
+            else:
+                invalid.append(addr)
+        return valid, invalid
+
+
+# =============================================================================
+# Command Executor
+# =============================================================================
+
+class CommandExecutor:
+    """Executes shell commands safely."""
+    
+    @staticmethod
+    def run(command: List[str], timeout: int = Config.CLI_TIMEOUT) -> OperationResult:
+        """Run a shell command and return the result."""
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return OperationResult(
+                success=result.returncode == 0,
+                output=result.stdout,
+                error=result.stderr
+            )
+        except subprocess.TimeoutExpired:
+            return OperationResult(False, "", f"Command timed out after {timeout}s")
+        except FileNotFoundError:
+            return OperationResult(False, "", "Command not found")
+        except Exception as e:
+            return OperationResult(False, "", str(e))
+    
+    @staticmethod
+    def check_spl_token_available() -> bool:
+        """Check if spl-token CLI is available."""
+        result = CommandExecutor.run(['spl-token', '--version'], timeout=5)
+        return result.success
+
+
+# =============================================================================
+# Metadata Service
+# =============================================================================
+
+class MetadataService:
+    """Fetches and caches token metadata from various sources."""
+    
+    def __init__(self):
+        self._cache: Dict[str, TokenMetadata] = {}
+        self._lock = threading.Lock()
+        self._loading = False
+    
+    def get(self, mint: str) -> TokenMetadata:
+        """Get metadata for a mint address."""
+        with self._lock:
+            return self._cache.get(mint, TokenMetadata())
+    
+    def set(self, mint: str, metadata: TokenMetadata) -> None:
+        """Cache metadata for a mint address."""
+        with self._lock:
+            self._cache[mint] = metadata
+    
+    def has(self, mint: str) -> bool:
+        """Check if metadata is cached for a mint."""
+        with self._lock:
+            return mint in self._cache
+    
+    @property
+    def cache_size(self) -> int:
+        """Number of cached entries."""
+        with self._lock:
+            return len(self._cache)
+    
+    def load_from_api(self, callback: Callable[[bool, str], None]) -> None:
+        """Load metadata from token list APIs in background."""
+        if self._loading:
             return
         
-        self.metadata_loading = True
-        self.log_message("Loading token metadata...", "INFO")
+        self._loading = True
         
-        def fetch_metadata():
-            last_error = None
+        def fetch():
+            last_error = ""
             
-            for url in self.TOKEN_LIST_URLS:
+            for url in Config.TOKEN_LIST_URLS:
                 try:
                     req = urllib.request.Request(
                         url,
-                        headers={'User-Agent': 'TokenCloser/1.0'}
+                        headers={'User-Agent': f'TokenCloser/{Config.APP_VERSION}'}
                     )
-                    with urllib.request.urlopen(req, timeout=15) as response:
+                    with urllib.request.urlopen(req, timeout=Config.API_TIMEOUT) as response:
                         data = json.loads(response.read().decode('utf-8'))
                         
                         # Handle different response formats
                         tokens = data
                         if isinstance(data, dict):
-                            # Solana token list format has tokens under 'tokens' key
                             tokens = data.get('tokens', data.get('data', []))
                         
                         if not isinstance(tokens, list):
                             continue
                         
-                        # Build cache from token list
                         count = 0
                         with self._lock:
                             for token in tokens:
                                 mint = token.get('address', '')
                                 if mint:
-                                    self.token_metadata_cache[mint] = {
-                                        'name': token.get('name', ''),
-                                        'symbol': token.get('symbol', ''),
-                                        'description': token.get('description', '') or token.get('name', '')
-                                    }
+                                    self._cache[mint] = TokenMetadata(
+                                        name=token.get('name', ''),
+                                        symbol=token.get('symbol', ''),
+                                        description=token.get('description', '') or token.get('name', '')
+                                    )
                                     count += 1
                         
                         if count > 0:
-                            final_count = count
-                            self.root.after(0, lambda c=final_count: self.log_message(
-                                f"Loaded metadata for {c} tokens", "SUCCESS"))
-                            self.root.after(0, self.update_accounts_display)
-                            self.metadata_loading = False
-                            return  # Success - stop trying other URLs
+                            self._loading = False
+                            callback(True, f"Loaded metadata for {count} tokens")
+                            return
                             
                 except urllib.error.URLError as ex:
-                    last_error = str(ex.reason) if hasattr(ex, 'reason') else str(ex)
+                    last_error = str(getattr(ex, 'reason', ex))
                 except Exception as ex:
                     last_error = str(ex)
             
-            # All URLs failed
-            if last_error:
-                err = last_error
-                self.root.after(0, lambda msg=err: self.log_message(
-                    f"Could not load token metadata (will use CLI fallback): {msg}", "WARNING"))
-            
-            self.metadata_loading = False
+            self._loading = False
+            callback(False, f"Could not load token metadata: {last_error}")
         
-        threading.Thread(target=fetch_metadata, daemon=True).start()
+        threading.Thread(target=fetch, daemon=True).start()
     
-    def get_token_info(self, mint: str) -> Dict[str, str]:
-        """Get token name and symbol for a mint address"""
-        with self._lock:
-            if mint in self.token_metadata_cache:
-                return self.token_metadata_cache[mint]
-        return {'name': '', 'symbol': '', 'description': ''}
-    
-    def fetch_token_metadata_cli(self, mint: str) -> Optional[Dict[str, str]]:
-        """Fetch token metadata using spl-token display command"""
-        if not self.is_valid_solana_address(mint):
+    def fetch_from_cli(self, mint: str) -> Optional[TokenMetadata]:
+        """Fetch metadata using spl-token display command."""
+        if not SecurityUtils.is_valid_solana_address(mint):
             return None
         
-        try:
-            success, output, error = self.run_command(
-                ['spl-token', 'display', mint], timeout=10
-            )
-            if success and output:
-                name = ''
-                symbol = ''
-                for line in output.split('\n'):
-                    if 'Name:' in line:
-                        name = line.split('Name:')[-1].strip()
-                    elif 'Symbol:' in line:
-                        symbol = line.split('Symbol:')[-1].strip()
-                
-                if name or symbol:
-                    return {'name': name, 'symbol': symbol, 'description': name}
-        except Exception:
-            pass
+        result = CommandExecutor.run(
+            ['spl-token', 'display', mint],
+            timeout=Config.METADATA_FETCH_TIMEOUT
+        )
+        
+        if result.success and result.output:
+            name = symbol = ""
+            for line in result.output.split('\n'):
+                if 'Name:' in line:
+                    name = line.split('Name:')[-1].strip()
+                elif 'Symbol:' in line:
+                    symbol = line.split('Symbol:')[-1].strip()
+            
+            if name or symbol:
+                return TokenMetadata(name=name, symbol=symbol, description=name)
+        
         return None
     
-    def fetch_token_metadata_dexscreener(self, mint: str) -> Optional[Dict[str, str]]:
-        """Fetch token metadata from DexScreener API"""
-        if not self.is_valid_solana_address(mint):
+    def fetch_from_dexscreener(self, mint: str) -> Optional[TokenMetadata]:
+        """Fetch metadata from DexScreener API."""
+        if not SecurityUtils.is_valid_solana_address(mint):
             return None
         
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'TokenCloser/1.0'})
-            with urllib.request.urlopen(req, timeout=10) as response:
+            req = urllib.request.Request(
+                url,
+                headers={'User-Agent': f'TokenCloser/{Config.APP_VERSION}'}
+            )
+            with urllib.request.urlopen(req, timeout=Config.METADATA_FETCH_TIMEOUT) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 pairs = data.get('pairs', [])
+                
                 if pairs:
-                    # Get info from first pair's base token
-                    base_token = pairs[0].get('baseToken', {})
-                    if base_token.get('address', '').lower() == mint.lower():
-                        name = base_token.get('name', '')
-                        symbol = base_token.get('symbol', '')
-                        if name or symbol:
-                            return {'name': name, 'symbol': symbol, 'description': name}
-                    # Check quote token too
-                    quote_token = pairs[0].get('quoteToken', {})
-                    if quote_token.get('address', '').lower() == mint.lower():
-                        name = quote_token.get('name', '')
-                        symbol = quote_token.get('symbol', '')
-                        if name or symbol:
-                            return {'name': name, 'symbol': symbol, 'description': name}
+                    for token_key in ['baseToken', 'quoteToken']:
+                        token = pairs[0].get(token_key, {})
+                        if token.get('address', '').lower() == mint.lower():
+                            name = token.get('name', '')
+                            symbol = token.get('symbol', '')
+                            if name or symbol:
+                                return TokenMetadata(name=name, symbol=symbol, description=name)
         except Exception:
             pass
+        
         return None
     
-    def load_missing_metadata(self):
-        """Load metadata for tokens not in the cache using multiple fallbacks"""
-        def fetch_missing():
-            mints_to_fetch = set()
-            for account in self.token_accounts:
-                mint = account.get('mint', '')
-                with self._lock:
-                    if mint and mint not in self.token_metadata_cache:
-                        mints_to_fetch.add(mint)
-            
-            if not mints_to_fetch:
-                return
-            
-            self.root.after(0, lambda n=len(mints_to_fetch): self.log_message(
-                f"Fetching metadata for {n} unknown tokens...", "INFO"))
-            
-            fetched = 0
-            for mint in mints_to_fetch:
-                info = None
-                
-                # Try CLI first (fastest, works offline)
-                info = self.fetch_token_metadata_cli(mint)
-                
-                # Try DexScreener for trading tokens
-                if not info:
-                    info = self.fetch_token_metadata_dexscreener(mint)
-                
-                if info:
-                    with self._lock:
-                        self.token_metadata_cache[mint] = info
-                    fetched += 1
-                    # Update display periodically as we fetch
-                    if fetched % 5 == 0:
-                        self.root.after(0, self.update_accounts_display)
-            
-            if fetched > 0:
-                self.root.after(0, lambda n=fetched: self.log_message(
-                    f"Fetched metadata for {n} additional tokens", "SUCCESS"))
-            self.root.after(0, self.update_accounts_display)
+    def fetch_missing(self, mints: Set[str], progress_callback: Callable[[int, int], None]) -> int:
+        """Fetch metadata for mints not in cache. Returns count fetched."""
+        to_fetch = [m for m in mints if not self.has(m) and SecurityUtils.is_valid_solana_address(m)]
         
-        threading.Thread(target=fetch_missing, daemon=True).start()
+        if not to_fetch:
+            return 0
+        
+        fetched = 0
+        for i, mint in enumerate(to_fetch):
+            # Try CLI first, then DexScreener
+            metadata = self.fetch_from_cli(mint) or self.fetch_from_dexscreener(mint)
+            
+            if metadata:
+                self.set(mint, metadata)
+                fetched += 1
+            
+            progress_callback(i + 1, len(to_fetch))
+        
+        return fetched
+
+
+# =============================================================================
+# Theme & Styles
+# =============================================================================
+
+class AppTheme:
+    """Application theme and styling."""
     
-    def create_widgets(self):
-        """Create the main UI widgets"""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+    # Colors
+    BG_PRIMARY = "#f8f9fa"
+    BG_SECONDARY = "#ffffff"
+    ACCENT = "#0d6efd"
+    ACCENT_HOVER = "#0b5ed7"
+    DANGER = "#dc3545"
+    DANGER_HOVER = "#bb2d3b"
+    SUCCESS = "#198754"
+    WARNING = "#ffc107"
+    TEXT_PRIMARY = "#212529"
+    TEXT_SECONDARY = "#6c757d"
+    BORDER = "#dee2e6"
+    
+    @classmethod
+    def apply(cls, root: tk.Tk) -> None:
+        """Apply theme to the application."""
+        style = ttk.Style()
         
-        # Configure grid weights
+        # Use clam theme as base (more customizable)
+        style.theme_use('clam')
+        
+        # Configure general styles
+        style.configure('.', font=('Segoe UI', 10))
+        style.configure('TFrame', background=cls.BG_PRIMARY)
+        style.configure('TLabel', background=cls.BG_PRIMARY, foreground=cls.TEXT_PRIMARY)
+        style.configure('TLabelframe', background=cls.BG_PRIMARY)
+        style.configure('TLabelframe.Label', background=cls.BG_PRIMARY, font=('Segoe UI', 10, 'bold'))
+        
+        # Button styles
+        style.configure('TButton', padding=(12, 6), font=('Segoe UI', 9))
+        style.map('TButton',
+            background=[('active', cls.ACCENT_HOVER), ('!active', cls.ACCENT)],
+            foreground=[('active', 'white'), ('!active', 'white')]
+        )
+        
+        # Danger button
+        style.configure('Danger.TButton', padding=(12, 6))
+        style.map('Danger.TButton',
+            background=[('active', cls.DANGER_HOVER), ('!active', cls.DANGER)],
+            foreground=[('active', 'white'), ('!active', 'white')]
+        )
+        
+        # Treeview
+        style.configure('Treeview',
+            background=cls.BG_SECONDARY,
+            foreground=cls.TEXT_PRIMARY,
+            fieldbackground=cls.BG_SECONDARY,
+            rowheight=28
+        )
+        style.configure('Treeview.Heading',
+            font=('Segoe UI', 9, 'bold'),
+            padding=(8, 4)
+        )
+        style.map('Treeview',
+            background=[('selected', cls.ACCENT)],
+            foreground=[('selected', 'white')]
+        )
+        
+        # Checkbutton
+        style.configure('TCheckbutton', background=cls.BG_PRIMARY)
+
+
+# =============================================================================
+# Main Application
+# =============================================================================
+
+class TokenAccountCloser:
+    """Main application class."""
+    
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(f"{Config.APP_NAME} v{Config.APP_VERSION}")
+        self.root.geometry(Config.WINDOW_SIZE)
+        self.root.configure(bg=AppTheme.BG_PRIMARY)
+        self.root.minsize(900, 600)
+        
+        # Apply theme
+        AppTheme.apply(root)
+        
+        # State
+        self._lock = threading.Lock()
+        self.accounts: List[TokenAccount] = []
+        self.selected_addresses: Set[str] = set()
+        self.metadata_service = MetadataService()
+        
+        # Build UI
+        self._create_ui()
+        
+        # Initial data load
+        self._load_metadata()
+        self._refresh_accounts()
+    
+    # -------------------------------------------------------------------------
+    # UI Construction
+    # -------------------------------------------------------------------------
+    
+    def _create_ui(self) -> None:
+        """Create the main UI."""
+        # Main container
+        main = ttk.Frame(self.root, padding=15)
+        main.grid(row=0, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(2, weight=1)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(2, weight=3)
+        main.rowconfigure(3, weight=1)
         
-        # Title
-        title_label = ttk.Label(main_frame, text="🔒 Solana Token Account Closer", 
-                               font=('Helvetica', 16, 'bold'))
-        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+        # Header
+        self._create_header(main)
         
-        # Control buttons frame
-        control_frame = ttk.Frame(main_frame)
-        control_frame.grid(row=1, column=0, columnspan=3, pady=(0, 10), sticky=(tk.W, tk.E))
+        # Toolbar
+        self._create_toolbar(main)
         
-        # Refresh button
-        self.refresh_btn = ttk.Button(control_frame, text="🔄 Refresh Accounts", 
-                                     command=self.refresh_accounts)
-        self.refresh_btn.pack(side=tk.LEFT, padx=(0, 10))
+        # Account list
+        self._create_account_list(main)
         
-        # Select all button
-        self.select_all_btn = ttk.Button(control_frame, text="☑️ Select All", 
-                                        command=self.select_all_accounts)
-        self.select_all_btn.pack(side=tk.LEFT, padx=(0, 10))
+        # Log panel
+        self._create_log_panel(main)
         
-        # Deselect all button
-        self.deselect_all_btn = ttk.Button(control_frame, text="☐ Deselect All", 
-                                          command=self.deselect_all_accounts)
-        self.deselect_all_btn.pack(side=tk.LEFT, padx=(0, 10))
+        # Status bar
+        self._create_status_bar(main)
+    
+    def _create_header(self, parent: ttk.Frame) -> None:
+        """Create header section."""
+        header = ttk.Frame(parent)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 15))
         
-        # Clear selections button (for after closure)
-        self.clear_selections_btn = ttk.Button(control_frame, text="🧹 Clear Selections", 
-                                             command=self.clear_selections_after_closure)
-        self.clear_selections_btn.pack(side=tk.LEFT, padx=(0, 10))
+        title = ttk.Label(
+            header,
+            text=f"🔐 {Config.APP_NAME}",
+            font=('Segoe UI', 18, 'bold')
+        )
+        title.pack(side=tk.LEFT)
         
-        # Preview commands button
-        self.preview_btn = ttk.Button(control_frame, text="👁️ Preview Commands", 
-                                     command=self.preview_commands)
+        version = ttk.Label(
+            header,
+            text=f"v{Config.APP_VERSION}",
+            foreground=AppTheme.TEXT_SECONDARY
+        )
+        version.pack(side=tk.LEFT, padx=(10, 0))
+    
+    def _create_toolbar(self, parent: ttk.Frame) -> None:
+        """Create toolbar with action buttons."""
+        toolbar = ttk.Frame(parent)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         
-        # Dry run button
-        self.dryrun_btn = ttk.Button(control_frame, text="🧪 Dry Run", 
-                                    command=self.dry_run_commands)
-        self.dryrun_btn.pack(side=tk.LEFT, padx=(0, 10))
+        # Left side buttons
+        left = ttk.Frame(toolbar)
+        left.pack(side=tk.LEFT)
         
-        # Burn before close checkbox
-        self.burn_before_close_var = tk.BooleanVar()
-        self.burn_checkbox = ttk.Checkbutton(control_frame, text="🔥 Burn Before Close", 
-                                           variable=self.burn_before_close_var,
-                                           command=self.on_burn_option_changed)
-        self.burn_checkbox.pack(side=tk.LEFT, padx=(0, 10))
+        self.refresh_btn = ttk.Button(left, text="⟳ Refresh", command=self._refresh_accounts)
+        self.refresh_btn.pack(side=tk.LEFT, padx=(0, 8))
         
-        # Close selected button
-        self.close_btn = ttk.Button(control_frame, text="🗑️ Close Selected", 
-                                   command=self.close_selected_accounts, 
-                                   style='Danger.TButton')
-        self.close_btn.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(left, text="☑ Select All", command=self._select_all).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(left, text="☐ Clear", command=self._deselect_all).pack(side=tk.LEFT, padx=(0, 8))
         
-        # Status label
-        self.status_label = ttk.Label(control_frame, text="Ready", foreground='green')
-        self.status_label.pack(side=tk.RIGHT)
+        ttk.Separator(left, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
         
-        # Accounts list frame
-        list_frame = ttk.LabelFrame(main_frame, text="Token Accounts", padding="5")
-        list_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
+        ttk.Button(left, text="📋 Preview", command=self._show_preview).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(left, text="🧪 Dry Run", command=self._show_dry_run).pack(side=tk.LEFT, padx=(0, 8))
         
-        # Create Treeview for accounts
-        columns = ('select', 'symbol', 'name', 'balance', 'address', 'mint', 'decimals')
-        self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=15)
+        # Right side - action buttons
+        right = ttk.Frame(toolbar)
+        right.pack(side=tk.RIGHT)
         
-        # Define headings
-        self.tree.heading('select', text='Select')
-        self.tree.heading('symbol', text='Ticker')
-        self.tree.heading('name', text='Token Name')
-        self.tree.heading('balance', text='Balance')
-        self.tree.heading('address', text='Account Address')
-        self.tree.heading('mint', text='Token Mint')
-        self.tree.heading('decimals', text='Dec')
+        self.burn_var = tk.BooleanVar()
+        burn_cb = ttk.Checkbutton(
+            right,
+            text="🔥 Burn tokens first",
+            variable=self.burn_var,
+            command=self._on_burn_changed
+        )
+        burn_cb.pack(side=tk.LEFT, padx=(0, 15))
         
-        # Configure column widths
-        self.tree.column('select', width=50, anchor='center')
-        self.tree.column('symbol', width=80, anchor='w')
-        self.tree.column('name', width=180, anchor='w')
-        self.tree.column('balance', width=120, anchor='e')
-        self.tree.column('address', width=150)
-        self.tree.column('mint', width=150)
-        self.tree.column('decimals', width=50, anchor='center')
+        self.close_btn = ttk.Button(
+            right,
+            text="🗑️ Close Selected",
+            style='Danger.TButton',
+            command=self._close_selected
+        )
+        self.close_btn.pack(side=tk.LEFT)
+    
+    def _create_account_list(self, parent: ttk.Frame) -> None:
+        """Create the account list treeview."""
+        frame = ttk.LabelFrame(parent, text="Token Accounts", padding=8)
+        frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        
+        # Columns configuration
+        columns = ('select', 'symbol', 'name', 'balance', 'address', 'mint', 'dec')
+        self.tree = ttk.Treeview(frame, columns=columns, show='headings', selectmode='browse')
+        
+        # Column headings and widths
+        col_config = [
+            ('select', '✓', 40, 'center'),
+            ('symbol', 'Ticker', 90, 'w'),
+            ('name', 'Token Name', 200, 'w'),
+            ('balance', 'Balance', 130, 'e'),
+            ('address', 'Account', 160, 'w'),
+            ('mint', 'Mint', 160, 'w'),
+            ('dec', 'Dec', 45, 'center'),
+        ]
+        
+        for col_id, heading, width, anchor in col_config:
+            self.tree.heading(col_id, text=heading, command=lambda c=col_id: self._sort_column(c))
+            self.tree.column(col_id, width=width, anchor=anchor, minwidth=40)
         
         # Scrollbars
-        v_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        h_scrollbar = ttk.Scrollbar(list_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+        v_scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        h_scroll = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
         
-        # Grid layout for tree and scrollbars
-        self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        v_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        h_scrollbar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        # Layout
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
         
-        # Bind double-click to toggle selection
-        self.tree.bind('<Double-1>', self.toggle_selection)
-        
-        # Log frame
-        log_frame = ttk.LabelFrame(main_frame, text="Operation Log", padding="5")
-        log_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S))
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        
-        # Log text area
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, wrap=tk.WORD)
-        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Configure row weights for main frame
-        main_frame.rowconfigure(2, weight=3)
-        main_frame.rowconfigure(3, weight=1)
+        # Bindings
+        self.tree.bind('<Double-1>', self._on_row_double_click)
+        self.tree.bind('<Return>', self._on_row_double_click)
+        self.tree.bind('<space>', self._on_row_double_click)
     
-    def log_message(self, message: str, level: str = "INFO"):
-        """Add a message to the log with timestamp"""
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        color_map = {
-            "INFO": "black",
-            "SUCCESS": "green",
-            "ERROR": "red",
-            "WARNING": "orange"
-        }
+    def _create_log_panel(self, parent: ttk.Frame) -> None:
+        """Create the log panel."""
+        frame = ttk.LabelFrame(parent, text="Activity Log", padding=8)
+        frame.grid(row=3, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
         
-        self.log_text.insert(tk.END, f"[{timestamp}] {level}: {message}\n")
+        self.log_text = scrolledtext.ScrolledText(
+            frame,
+            height=6,
+            wrap=tk.WORD,
+            font=('Consolas', 9),
+            bg=AppTheme.BG_SECONDARY,
+            relief=tk.FLAT,
+            borderwidth=1
+        )
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        
+        # Configure log colors
+        self.log_text.tag_configure('INFO', foreground='black')
+        self.log_text.tag_configure('SUCCESS', foreground=AppTheme.SUCCESS)
+        self.log_text.tag_configure('WARNING', foreground='#b86e00')
+        self.log_text.tag_configure('ERROR', foreground=AppTheme.DANGER)
+    
+    def _create_status_bar(self, parent: ttk.Frame) -> None:
+        """Create status bar."""
+        status = ttk.Frame(parent)
+        status.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        
+        self.status_label = ttk.Label(status, text="Ready", foreground=AppTheme.TEXT_SECONDARY)
+        self.status_label.pack(side=tk.LEFT)
+        
+        self.selection_label = ttk.Label(status, text="", foreground=AppTheme.TEXT_SECONDARY)
+        self.selection_label.pack(side=tk.RIGHT)
+    
+    # -------------------------------------------------------------------------
+    # Logging
+    # -------------------------------------------------------------------------
+    
+    def _log(self, message: str, level: LogLevel = LogLevel.INFO) -> None:
+        """Add a message to the log."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefix = f"[{timestamp}] "
+        
+        self.log_text.insert(tk.END, prefix, level.value[1])
+        self.log_text.insert(tk.END, f"{message}\n", level.value[1])
         self.log_text.see(tk.END)
         
-        # Update status label
-        self.status_label.config(text=message, foreground=color_map.get(level, "black"))
+        # Update status
+        self.status_label.config(text=message, foreground=level.value[0])
     
-    def run_command(self, command: List[str], timeout: int = 30) -> tuple:
-        """Run a shell command and return (success, output, error)"""
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-            return (result.returncode == 0, result.stdout, result.stderr)
-        except subprocess.TimeoutExpired:
-            return (False, "", f"Command timed out after {timeout} seconds")
-        except Exception as e:
-            return (False, "", str(e))
+    def _log_threadsafe(self, message: str, level: LogLevel = LogLevel.INFO) -> None:
+        """Thread-safe logging."""
+        self.root.after(0, lambda: self._log(message, level))
     
-    def refresh_accounts(self):
-        """Refresh the list of token accounts"""
-        self.log_message("Refreshing token accounts...")
+    # -------------------------------------------------------------------------
+    # Data Operations
+    # -------------------------------------------------------------------------
+    
+    def _load_metadata(self) -> None:
+        """Load token metadata from APIs."""
+        self._log("Loading token metadata...")
+        
+        def callback(success: bool, message: str):
+            level = LogLevel.SUCCESS if success else LogLevel.WARNING
+            self._log_threadsafe(message, level)
+            if success:
+                self.root.after(0, self._update_display)
+        
+        self.metadata_service.load_from_api(callback)
+    
+    def _refresh_accounts(self) -> None:
+        """Refresh the list of token accounts."""
+        self._log("Refreshing token accounts...")
         self.refresh_btn.config(state='disabled')
         
-        # Run in background thread to avoid blocking UI
-        def refresh_thread():
-            try:
-                # Get token accounts
-                success, output, error = self.run_command(['spl-token', 'accounts', '--output', 'json'])
-                
-                if success:
-                    try:
-                        accounts_data = json.loads(output)
-                        self.token_accounts = accounts_data.get('accounts', [])
-                        num_accounts = len(self.token_accounts)
-                        self.root.after(0, self.update_accounts_display)
-                        self.root.after(0, lambda n=num_accounts: self.log_message(f"Found {n} token accounts", "SUCCESS"))
-                        # Try to load metadata for any unknown tokens
-                        self.root.after(500, self.load_missing_metadata)
-                    except json.JSONDecodeError:
-                        self.root.after(0, lambda: self.log_message("Failed to parse accounts data", "ERROR"))
-                else:
-                    err_msg = str(error)
-                    self.root.after(0, lambda msg=err_msg: self.log_message(f"Failed to get accounts: {msg}", "ERROR"))
-                
-                self.root.after(0, lambda: self.refresh_btn.config(state='normal'))
-                
-            except Exception as ex:
-                err_msg = str(ex)
-                self.root.after(0, lambda msg=err_msg: self.log_message(f"Error refreshing accounts: {msg}", "ERROR"))
-                self.root.after(0, lambda: self.refresh_btn.config(state='normal'))
+        def fetch():
+            result = CommandExecutor.run(['spl-token', 'accounts', '--output', 'json'])
+            
+            if result.success:
+                try:
+                    data = json.loads(result.output)
+                    accounts = [TokenAccount.from_json(a) for a in data.get('accounts', [])]
+                    
+                    with self._lock:
+                        self.accounts = accounts
+                    
+                    count = len(accounts)
+                    self._log_threadsafe(f"Found {count} token accounts", LogLevel.SUCCESS)
+                    self.root.after(0, self._update_display)
+                    self.root.after(500, self._fetch_missing_metadata)
+                    
+                except json.JSONDecodeError:
+                    self._log_threadsafe("Failed to parse account data", LogLevel.ERROR)
+            else:
+                self._log_threadsafe(f"Failed: {result.error}", LogLevel.ERROR)
+            
+            self.root.after(0, lambda: self.refresh_btn.config(state='normal'))
         
-        threading.Thread(target=refresh_thread, daemon=True).start()
+        threading.Thread(target=fetch, daemon=True).start()
     
-    def update_accounts_display(self):
-        """Update the accounts display in the treeview"""
-        # Clear existing items
+    def _fetch_missing_metadata(self) -> None:
+        """Fetch metadata for accounts not in cache."""
+        mints = {a.mint for a in self.accounts}
+        missing = [m for m in mints if not self.metadata_service.has(m)]
+        
+        if not missing:
+            return
+        
+        self._log(f"Fetching metadata for {len(missing)} unknown tokens...")
+        
+        def fetch():
+            def progress(current: int, total: int):
+                if current % 5 == 0:
+                    self.root.after(0, self._update_display)
+            
+            count = self.metadata_service.fetch_missing(set(missing), progress)
+            
+            if count > 0:
+                self._log_threadsafe(f"Fetched metadata for {count} tokens", LogLevel.SUCCESS)
+            self.root.after(0, self._update_display)
+        
+        threading.Thread(target=fetch, daemon=True).start()
+    
+    # -------------------------------------------------------------------------
+    # UI Updates
+    # -------------------------------------------------------------------------
+    
+    def _update_display(self) -> None:
+        """Update the accounts display."""
+        # Clear tree
         for item in self.tree.get_children():
             self.tree.delete(item)
         
-        # Add accounts to treeview
-        for account in self.token_accounts:
-            # Create checkbox-like selection indicator
-            select_text = "☑️" if account.get('address') in self.selected_accounts else "☐"
-            
-            # Get token amount information
-            token_amount = account.get('tokenAmount', {})
-            balance_amount = token_amount.get('uiAmountString', '0')
-            decimals = token_amount.get('decimals', 0)
-            
-            # Get mint address
-            mint = account.get('mint', 'Unknown')
-            
-            # Get token metadata (name, symbol)
-            token_info = self.get_token_info(mint)
-            symbol = token_info.get('symbol', '') or '—'
-            name = token_info.get('name', '') or '—'
-            
-            # Truncate address for display
-            address = account.get('address', 'Unknown')
-            address_display = f"{address[:8]}...{address[-6:]}" if len(address) > 20 else address
-            mint_display = f"{mint[:8]}...{mint[-6:]}" if len(mint) > 20 else mint
-            
-            # Insert into treeview
-            item = self.tree.insert('', 'end', values=(
-                select_text,
-                symbol,
-                name,
-                balance_amount,
-                address_display,
-                mint_display,
-                decimals
-            ))
-            
-            # Store full address as a tag for retrieval
-            self.tree.item(item, tags=(address,))
+        # Populate tree
+        with self._lock:
+            for account in self.accounts:
+                selected = "☑" if account.address in self.selected_addresses else "☐"
+                metadata = self.metadata_service.get(account.mint)
+                
+                item = self.tree.insert('', 'end', values=(
+                    selected,
+                    metadata.display_symbol,
+                    metadata.display_name,
+                    account.balance,
+                    account.display_address,
+                    account.display_mint,
+                    account.decimals
+                ), tags=(account.address,))
+        
+        self._update_selection_count()
     
-    def toggle_selection(self, event):
-        """Toggle selection of an account when double-clicked"""
+    def _update_selection_count(self) -> None:
+        """Update selection count display."""
+        count = len(self.selected_addresses)
+        
+        # Update label
+        if count > 0:
+            self.selection_label.config(text=f"{count} selected")
+        else:
+            self.selection_label.config(text="")
+        
+        # Update button text
+        if count > 0:
+            action = "🔥 Burn & Close" if self.burn_var.get() else "🗑️ Close"
+            self.close_btn.config(text=f"{action} {count}")
+        else:
+            self.close_btn.config(text="🗑️ Close Selected")
+    
+    def _sort_column(self, col: str) -> None:
+        """Sort treeview by column."""
+        items = [(self.tree.set(item, col), item) for item in self.tree.get_children('')]
+        items.sort()
+        
+        for index, (val, item) in enumerate(items):
+            self.tree.move(item, '', index)
+    
+    # -------------------------------------------------------------------------
+    # Selection Handling
+    # -------------------------------------------------------------------------
+    
+    def _on_row_double_click(self, event) -> None:
+        """Handle row double-click to toggle selection."""
         selection = self.tree.selection()
         if not selection:
             return
         
-        item = selection[0]
-        # Get full address from tags (we store it there since display is truncated)
-        tags = self.tree.item(item, 'tags')
+        tags = self.tree.item(selection[0], 'tags')
         if not tags:
-            self.log_message("Could not get account address", "ERROR")
             return
         
-        account_address = tags[0]
-        
-        # Validate address format before adding to selection
-        if not self.is_valid_solana_address(account_address):
-            self.log_message(f"Invalid address format: {account_address[:20]}...", "ERROR")
+        address = tags[0]
+        if not SecurityUtils.is_valid_solana_address(address):
+            self._log(f"Invalid address: {address[:20]}...", LogLevel.ERROR)
             return
         
         with self._lock:
-            if account_address in self.selected_accounts:
-                self.selected_accounts.remove(account_address)
+            if address in self.selected_addresses:
+                self.selected_addresses.discard(address)
             else:
-                self.selected_accounts.add(account_address)
+                self.selected_addresses.add(address)
         
-        # Update the display to show current selection state
-        self.update_accounts_display()
-        self.update_selection_count()
+        self._update_display()
     
-    def select_all_accounts(self):
-        """Select all visible accounts"""
+    def _select_all(self) -> None:
+        """Select all accounts."""
         with self._lock:
-            self.selected_accounts.clear()
-            invalid_count = 0
-            for account in self.token_accounts:
-                addr = account.get('address')
-                if self.is_valid_solana_address(addr):
-                    self.selected_accounts.add(addr)
-                else:
-                    invalid_count += 1
+            self.selected_addresses.clear()
+            for account in self.accounts:
+                if SecurityUtils.is_valid_solana_address(account.address):
+                    self.selected_addresses.add(account.address)
         
-        self.update_accounts_display()
-        self.update_selection_count()
-        if invalid_count > 0:
-            self.log_message(f"Selected {len(self.selected_accounts)} accounts ({invalid_count} invalid skipped)", "WARNING")
-        else:
-            self.log_message(f"Selected all {len(self.selected_accounts)} accounts", "INFO")
+        self._update_display()
+        self._log(f"Selected {len(self.selected_addresses)} accounts")
     
-    def deselect_all_accounts(self):
-        """Deselect all accounts"""
+    def _deselect_all(self) -> None:
+        """Deselect all accounts."""
         with self._lock:
-            self.selected_accounts.clear()
-        self.update_accounts_display()
-        self.update_selection_count()
-        self.log_message("Deselected all accounts", "INFO")
+            self.selected_addresses.clear()
+        self._update_display()
+        self._log("Cleared selection")
     
-    def update_selection_count(self):
-        """Update the close button text with selection count"""
-        count = len(self.selected_accounts)
-        if count > 0:
-            if self.burn_before_close_var.get():
-                self.close_btn.config(text=f"🔥 Burn & Close {count} Selected")
-            else:
-                self.close_btn.config(text=f"🗑️ Close {count} Selected")
-        else:
-            if self.burn_before_close_var.get():
-                self.close_btn.config(text="🔥 Burn & Close Selected")
-            else:
-                self.close_btn.config(text="🗑️ Close Selected")
+    def _on_burn_changed(self) -> None:
+        """Handle burn checkbox change."""
+        if self.burn_var.get():
+            self._log("🔥 Burn before close enabled")
+        self._update_selection_count()
     
-    def create_command_preview(self):
-        """Create a preview of the exact commands that will be executed"""
-        preview_lines = []
-        
-        if self.burn_before_close_var.get():
-            preview_lines.append("🔥 BURN BEFORE CLOSE OPERATION:")
-            preview_lines.append("=" * 40)
-            preview_lines.append("")
-            
-            for i, account_address in enumerate(self.selected_accounts, 1):
-                # Find account details for display
-                account_info = None
-                for account in self.token_accounts:
-                    if account.get('address') == account_address:
-                        account_info = account
-                        break
-                
-                if account_info:
-                    mint = account_info.get('mint', 'Unknown')
-                    balance = account_info.get('tokenAmount', {}).get('uiAmountString', '0')
-                    decimals = account_info.get('tokenAmount', {}).get('decimals', 0)
-                    
-                    preview_lines.append(f"{i}. BURN: spl-token burn {account_address} ALL")
-                    preview_lines.append(f"   Mint: {mint}")
-                    preview_lines.append(f"   Balance to burn: {balance} (decimals: {decimals})")
-                    preview_lines.append("")
-                    preview_lines.append(f"   CLOSE: spl-token close --address {account_address}")
-                    preview_lines.append("")
-                else:
-                    preview_lines.append(f"{i}. BURN: spl-token burn {account_address} ALL")
-                    preview_lines.append(f"   (Account details not found)")
-                    preview_lines.append("")
-                    preview_lines.append(f"   CLOSE: spl-token close --address {account_address}")
-                    preview_lines.append("")
-        else:
-            preview_lines.append("🗑️ DIRECT CLOSE OPERATION:")
-            preview_lines.append("=" * 30)
-            preview_lines.append("")
-            
-            for i, account_address in enumerate(self.selected_accounts, 1):
-                # Find account details for display
-                account_info = None
-                for account in self.token_accounts:
-                    if account.get('address') == account_address:
-                        account_info = account
-                        break
-                
-                if account_info:
-                    mint = account_info.get('mint', 'Unknown')
-                    balance = account_info.get('tokenAmount', {}).get('uiAmountString', '0')
-                    decimals = account_info.get('tokenAmount', {}).get('decimals', 0)
-                    
-                    preview_lines.append(f"{i}. spl-token close --address {account_address}")
-                    preview_lines.append(f"   Mint: {mint}")
-                    preview_lines.append(f"   Balance: {balance} (decimals: {decimals})")
-                    preview_lines.append("")
-                else:
-                    preview_lines.append(f"{i}. spl-token close --address {account_address}")
-                    preview_lines.append("   (Account details not found)")
-                    preview_lines.append("")
-        
-        return "\n".join(preview_lines)
+    # -------------------------------------------------------------------------
+    # Account Operations
+    # -------------------------------------------------------------------------
     
-    def preview_commands(self):
-        """Show a preview of the commands that would be executed"""
-        if not self.selected_accounts:
-            messagebox.showinfo("No Selection", "Please select at least one account to preview commands.")
+    def _get_account_by_address(self, address: str) -> Optional[TokenAccount]:
+        """Find account by address."""
+        for account in self.accounts:
+            if account.address == address:
+                return account
+        return None
+    
+    def _show_preview(self) -> None:
+        """Show command preview dialog."""
+        if not self.selected_addresses:
+            messagebox.showinfo("No Selection", "Please select at least one account.")
             return
         
-        preview_text = self.create_command_preview()
-        
-        # Create a detailed preview window
-        preview_window = tk.Toplevel(self.root)
-        preview_window.title("Preview Commands")
-        preview_window.geometry("700x500")
-        preview_window.transient(self.root)
-        preview_window.grab_set()
-        
-        # Title
-        title_label = ttk.Label(preview_window, text="🔍 Preview of Commands to Execute", 
-                               font=('Helvetica', 14, 'bold'))
-        title_label.pack(pady=(20, 10))
-        
-        # Warning
-        warning_label = ttk.Label(preview_window, 
-                                text="⚠️ This is a PREVIEW only. No accounts will be closed.", 
-                                font=('Helvetica', 10), foreground='red')
-        warning_label.pack(pady=(0, 20))
-        
-        # Preview text
-        preview_frame = ttk.Frame(preview_window)
-        preview_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
-        
-        preview_text_widget = scrolledtext.ScrolledText(preview_frame, wrap=tk.WORD, font=('Courier', 10))
-        preview_text_widget.pack(fill=tk.BOTH, expand=True)
-        preview_text_widget.insert(tk.END, preview_text)
-        preview_text_widget.config(state=tk.DISABLED)
-        
-        # Close button
-        close_btn = ttk.Button(preview_window, text="Close Preview", 
-                              command=preview_window.destroy)
-        close_btn.pack(pady=(0, 20))
+        preview = self._generate_preview()
+        self._show_text_dialog("Command Preview", preview, "⚠️ Preview only - no changes made")
     
-    def dry_run_commands(self):
-        """Perform a dry run to show exactly what would happen"""
-        if not self.selected_accounts:
-            messagebox.showinfo("No Selection", "Please select at least one account to dry run.")
+    def _show_dry_run(self) -> None:
+        """Show dry run report dialog."""
+        if not self.selected_addresses:
+            messagebox.showinfo("No Selection", "Please select at least one account.")
             return
         
-        dry_run_text = self.create_dry_run_report()
-        
-        # Create a detailed dry run window
-        dry_run_window = tk.Toplevel(self.root)
-        dry_run_window.title("Dry Run Report")
-        dry_run_window.geometry("800x600")
-        dry_run_window.transient(self.root)
-        dry_run_window.grab_set()
-        
-        # Title
-        title_label = ttk.Label(dry_run_window, text="🧪 Dry Run Report", 
-                               font=('Helvetica', 14, 'bold'))
-        title_label.pack(pady=(20, 10))
-        
-        # Safety notice
-        safety_label = ttk.Label(dry_run_window, 
-                               text="✅ This is a DRY RUN - No accounts will be closed!", 
-                               font=('Helvetica', 10), foreground='green')
-        safety_label.pack(pady=(0, 20))
-        
-        # Dry run text
-        dry_run_frame = ttk.Frame(dry_run_window)
-        dry_run_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
-        
-        dry_run_text_widget = scrolledtext.ScrolledText(dry_run_frame, wrap=tk.WORD, font=('Courier', 9))
-        dry_run_text_widget.pack(fill=tk.BOTH, expand=True)
-        dry_run_text_widget.insert(tk.END, dry_run_text)
-        dry_run_text_widget.config(state=tk.DISABLED)
-        
-        # Close button
-        close_btn = ttk.Button(dry_run_window, text="Close Report", 
-                              command=dry_run_window.destroy)
-        close_btn.pack(pady=(0, 20))
+        report = self._generate_dry_run_report()
+        self._show_text_dialog("Dry Run Report", report, "✅ No accounts will be closed")
     
-    def create_dry_run_report(self):
-        """Create a detailed dry run report"""
-        report_lines = []
-        report_lines.append("DRY RUN REPORT - NO ACCOUNTS WILL BE CLOSED")
-        report_lines.append("=" * 60)
-        report_lines.append("")
+    def _show_text_dialog(self, title: str, content: str, subtitle: str) -> None:
+        """Show a text dialog window."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("700x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
         
-        total_rent_recovery = 0
-        estimated_fees = 0
+        ttk.Label(dialog, text=f"📋 {title}", font=('Segoe UI', 14, 'bold')).pack(pady=(20, 5))
+        ttk.Label(dialog, text=subtitle, foreground=AppTheme.TEXT_SECONDARY).pack(pady=(0, 15))
         
-        for i, account_address in enumerate(self.selected_accounts, 1):
-            # Find account details
-            account_info = None
-            for account in self.token_accounts:
-                if account.get('address') == account_address:
-                    account_info = account
-                    break
-            
-            report_lines.append(f"ACCOUNT {i}:")
-            report_lines.append(f"  Address: {account_address}")
-            
-            if account_info:
-                mint = account_info.get('mint', 'Unknown')
-                balance = account_info.get('tokenAmount', {}).get('uiAmountString', '0')
-                decimals = account_info.get('tokenAmount', {}).get('decimals', 0)
-                is_native = account_info.get('isNative', False)
-                
-                report_lines.append(f"  Mint: {mint}")
-                report_lines.append(f"  Balance: {balance} (decimals: {decimals})")
-                report_lines.append(f"  Native: {is_native}")
-                
-                # Estimate rent recovery (rough estimate)
-                rent_recovery = 0.00203928  # Typical rent for token account
-                total_rent_recovery += rent_recovery
-                report_lines.append(f"  Estimated rent recovery: {rent_recovery:.6f} SOL")
-                
-            else:
-                report_lines.append(f"  (Account details not found)")
-            
-            # Estimate transaction fees based on burn option
-            if self.burn_before_close_var.get():
-                # Burn + close = 2 transactions per account
-                burn_fee = 0.000005  # Burn transaction fee
-                close_fee = 0.000005  # Close transaction fee
-                total_fee = burn_fee + close_fee
-                estimated_fees += total_fee
-                
-                report_lines.append(f"  🔥 Burn command: spl-token burn {account_address} ALL")
-                report_lines.append(f"  🗑️ Close command: spl-token close --address {account_address}")
-                report_lines.append(f"  💰 Total fees: {total_fee:.6f} SOL (burn + close)")
-            else:
-                # Just close = 1 transaction per account
-                tx_fee = 0.000005  # Typical transaction fee
-                estimated_fees += tx_fee
-                report_lines.append(f"  🗑️ Close command: spl-token close --address {account_address}")
-                report_lines.append(f"  💰 Transaction fee: {tx_fee:.6f} SOL")
-            
-            report_lines.append("")
+        text = scrolledtext.ScrolledText(dialog, wrap=tk.WORD, font=('Consolas', 9))
+        text.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
+        text.insert(tk.END, content)
+        text.config(state=tk.DISABLED)
         
-        # Summary
-        report_lines.append("SUMMARY:")
-        report_lines.append("=" * 30)
-        report_lines.append(f"Total accounts to close: {len(self.selected_accounts)}")
-        report_lines.append(f"Total estimated rent recovery: {total_rent_recovery:.6f} SOL")
-        
-        # Show cost savings from batching
-        if len(self.selected_accounts) > 1:
-            old_fee = estimated_fees  # Multiple individual transactions
-            new_fee = estimated_fees  # Current method still uses individual transactions
-            # Note: True batching would save money, but current implementation provides better error handling
-            
-            report_lines.append(f"💰 Transaction fees: {estimated_fees:.6f} SOL")
-            report_lines.append(f"📊 Note: True batching would reduce fees, but current method ensures reliability")
-        else:
-            report_lines.append(f"Estimated transaction fee: {estimated_fees:.6f} SOL")
-        
-        report_lines.append(f"Net SOL gain: {total_rent_recovery - estimated_fees:.6f} SOL")
-        report_lines.append("")
-        report_lines.append("⚠️  Remember: This is a DRY RUN only!")
-        report_lines.append("   No accounts will be closed until you click 'Close Selected'")
-        
-        if len(self.selected_accounts) > 1:
-            report_lines.append("")
-            report_lines.append("🚀 BATCHING BENEFITS:")
-            report_lines.append("   ✅ All accounts processed in sequence")
-            report_lines.append("   ✅ Better error handling and logging")
-            report_lines.append("   ✅ Automatic cleanup on failure")
-            report_lines.append("   ✅ More reliable execution")
-            report_lines.append("")
-            report_lines.append("💡 FUTURE IMPROVEMENT:")
-            report_lines.append("   🔧 True transaction batching would save ~80-90% on fees")
-            report_lines.append("   🔧 Requires advanced Solana transaction building")
-        
-        # Add burn information
-        if self.burn_before_close_var.get():
-            report_lines.append("")
-            report_lines.append("🔥 BURN BEFORE CLOSE BENEFITS:")
-            report_lines.append("   ✅ Tokens are completely removed from circulation")
-            report_lines.append("   ✅ Maximum SOL recovery from rent")
-            report_lines.append("   ✅ Clean account closure (no residual tokens)")
-            report_lines.append("   ⚠️  Note: Higher transaction fees due to burn operations")
-            report_lines.append("")
-            report_lines.append("💡 COST ANALYSIS:")
-            report_lines.append(f"   🔥 Burn operations: {len(self.selected_accounts) * 0.000005:.6f} SOL")
-            report_lines.append(f"   🗑️ Close operations: {len(self.selected_accounts) * 0.000005:.6f} SOL")
-            report_lines.append(f"   💰 Total cost: {estimated_fees:.6f} SOL")
-            report_lines.append(f"   📈 Rent recovery: {total_rent_recovery:.6f} SOL")
-            report_lines.append(f"   🎯 Net gain: {total_rent_recovery - estimated_fees:.6f} SOL")
-        
-        return "\n".join(report_lines)
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=(0, 20))
     
-    def on_burn_option_changed(self):
-        """Handle burn before close checkbox change"""
-        if self.burn_before_close_var.get():
-            self.log_message("🔥 Burn before close enabled - tokens will be burned before closing accounts", "INFO")
-            # Update button text to show burn action
-            if len(self.selected_accounts) > 0:
-                self.close_btn.config(text=f"🔥 Burn & Close {len(self.selected_accounts)} Selected")
-        else:
-            self.log_message("Burn before close disabled - accounts will be closed directly", "INFO")
-            # Restore normal button text
-            if len(self.selected_accounts) > 0:
-                self.close_btn.config(text=f"🗑️ Close {len(self.selected_accounts)} Selected")
-            else:
-                self.close_btn.config(text="🗑️ Close Selected")
-    
-    def clear_selections_after_closure(self):
-        """Clear all selections after successful account closure"""
-        with self._lock:
-            self.selected_accounts.clear()
-        self.update_selection_count()
-        self.update_accounts_display()
-        self.log_message("✅ Selections cleared after successful closure", "INFO")
+    def _generate_preview(self) -> str:
+        """Generate command preview text."""
+        lines = []
+        burn = self.burn_var.get()
         
-        # Show a brief message to the user
-        messagebox.showinfo("Selections Cleared", 
-                           "All selections have been cleared.\n"
-                           "You can now select new accounts for the next batch closure.")
+        lines.append("=" * 60)
+        lines.append(f"{'BURN & CLOSE' if burn else 'CLOSE'} PREVIEW")
+        lines.append("=" * 60)
+        lines.append("")
+        
+        for i, address in enumerate(sorted(self.selected_addresses), 1):
+            account = self._get_account_by_address(address)
+            metadata = self.metadata_service.get(account.mint) if account else TokenMetadata()
+            
+            lines.append(f"[{i}] {metadata.display_symbol} - {metadata.display_name}")
+            lines.append(f"    Address: {address}")
+            
+            if account:
+                lines.append(f"    Balance: {account.balance}")
+                lines.append(f"    Mint: {account.mint}")
+            
+            if burn:
+                lines.append(f"    → spl-token burn {address} ALL")
+            lines.append(f"    → spl-token close --address {address}")
+            lines.append("")
+        
+        return "\n".join(lines)
     
-    def run_batch_close(self):
-        """Execute a batch close operation using shell script for reliability"""
-        try:
-            # Validate all addresses before proceeding
-            with self._lock:
-                accounts_to_process = list(self.selected_accounts)
-            
-            for addr in accounts_to_process:
-                if not self.is_valid_solana_address(addr):
-                    return False, None, f"Invalid Solana address format: {addr[:20]}..."
-            
-            self.log_message("Using shell script approach for batch operations...", "INFO")
-            
-            script_content = "#!/bin/bash\n"
-            script_content += "set -e\n"
-            script_content += "echo '🚀 Starting batch operation...'\n"
-            script_content += f"echo '📊 Total accounts to process: {len(accounts_to_process)}'\n"
-            script_content += f"echo '⏱️  Estimated time: {len(accounts_to_process) * 5} seconds'\n"
-            script_content += "echo ''\n"
-            
-            if self.burn_before_close_var.get():
-                script_content += "echo '🔥 Starting burn before close operation...'\n"
-                script_content += "echo 'This will burn all tokens before closing accounts to maximize SOL recovery'\n"
-                script_content += "echo ''\n"
-                
-                for i, account_address in enumerate(accounts_to_process, 1):
-                    safe_addr = self.sanitize_for_shell(account_address)
-                    display_addr = account_address[:8]
-                    script_content += f"echo '🔥 [{i}/{len(accounts_to_process)}] Burning tokens in: {display_addr}...'\n"
-                    script_content += f"spl-token burn {safe_addr} ALL\n"
-                    script_content += f"echo '✅ [{i}/{len(accounts_to_process)}] Tokens burned successfully'\n"
-                    script_content += "echo ''\n"
-                
-                script_content += "echo '🔥 All tokens burned successfully!'\n"
-                script_content += "echo 'Now closing empty accounts...'\n"
-                script_content += "echo ''\n"
-            
-            script_content += "echo '🗑️ Starting batch closure...'\n"
-            script_content += "echo ''\n"
-            
-            for i, account_address in enumerate(accounts_to_process, 1):
-                safe_addr = self.sanitize_for_shell(account_address)
-                display_addr = account_address[:8]
-                script_content += f"echo '🗑️ [{i}/{len(accounts_to_process)}] Closing account: {display_addr}...'\n"
-                script_content += f"spl-token close --address {safe_addr}\n"
-                script_content += f"echo '✅ [{i}/{len(accounts_to_process)}] Account closed successfully'\n"
-                script_content += "echo ''\n"
-            
-            script_content += "echo '🎉 All accounts closed successfully!'\n"
-            script_content += "echo ''\n"
-            script_content += "echo '📊 FINAL SUMMARY:'\n"
-            script_content += f"echo '   ✅ Total accounts processed: {len(accounts_to_process)}'\n"
-            if self.burn_before_close_var.get():
-                script_content += f"echo '   🔥 Tokens burned: {len(accounts_to_process)} accounts'\n"
-            script_content += f"echo '   🗑️  Accounts closed: {len(accounts_to_process)}'\n"
-            script_content += "echo '   💰 SOL recovered from rent'\n"
-            script_content += "echo '   🎯 Operation completed successfully!'\n"
-            
-            # Create temp file with restrictive permissions (owner read/write only initially)
-            fd, script_file_path = tempfile.mkstemp(suffix='.sh', text=True)
+    def _generate_dry_run_report(self) -> str:
+        """Generate dry run report."""
+        lines = []
+        burn = self.burn_var.get()
+        count = len(self.selected_addresses)
+        
+        rent_total = count * Config.TOKEN_ACCOUNT_RENT
+        fee_total = count * Config.TX_FEE * (2 if burn else 1)
+        
+        lines.append("=" * 60)
+        lines.append("DRY RUN REPORT")
+        lines.append("=" * 60)
+        lines.append("")
+        lines.append(f"Accounts to close: {count}")
+        lines.append(f"Operation: {'Burn & Close' if burn else 'Close only'}")
+        lines.append("")
+        lines.append("COST ANALYSIS:")
+        lines.append(f"  Estimated rent recovery: {rent_total:.6f} SOL")
+        lines.append(f"  Estimated fees: {fee_total:.6f} SOL")
+        lines.append(f"  Net gain: {rent_total - fee_total:.6f} SOL")
+        lines.append("")
+        lines.append("ACCOUNTS:")
+        lines.append("-" * 40)
+        
+        for address in sorted(self.selected_addresses):
+            account = self._get_account_by_address(address)
+            metadata = self.metadata_service.get(account.mint) if account else TokenMetadata()
+            balance = account.balance if account else "?"
+            lines.append(f"  {metadata.display_symbol:10} {balance:>15}  {address[:16]}...")
+        
+        return "\n".join(lines)
+    
+    def _close_selected(self) -> None:
+        """Close selected accounts."""
+        if not self.selected_addresses:
+            messagebox.showwarning("No Selection", "Please select at least one account.")
+            return
+        
+        count = len(self.selected_addresses)
+        action = "burn and close" if self.burn_var.get() else "close"
+        
+        if not messagebox.askyesno(
+            "Confirm Closure",
+            f"Are you sure you want to {action} {count} account(s)?\n\n"
+            "This action cannot be undone.\n"
+            "SOL from rent will be returned to your wallet."
+        ):
+            return
+        
+        self.close_btn.config(state='disabled')
+        self._log(f"Starting {action} of {count} accounts...")
+        
+        def execute():
             try:
-                with os.fdopen(fd, 'w') as script_file:
-                    script_file.write(script_content)
+                with self._lock:
+                    addresses = list(self.selected_addresses)
                 
-                # Set executable only for owner (0o700)
-                os.chmod(script_file_path, 0o700)
+                # Validate all addresses
+                valid, invalid = SecurityUtils.validate_addresses(addresses)
+                if invalid:
+                    self._log_threadsafe(f"Skipping {len(invalid)} invalid addresses", LogLevel.WARNING)
                 
-                batch_timeout = 30 + (len(accounts_to_process) * 10)
-                self.log_message(f"Executing batch script with {batch_timeout}s timeout...", "INFO")
+                if not valid:
+                    self._log_threadsafe("No valid addresses to process", LogLevel.ERROR)
+                    return
                 
-                success, output, error = self.run_command(['bash', script_file_path], timeout=batch_timeout)
+                success = self._execute_batch_close(valid)
                 
                 if success:
-                    self.log_message("✅ Batch closure successful with shell script!", "SUCCESS")
-                    return True, output, None
+                    self._log_threadsafe(f"✅ Successfully closed {len(valid)} accounts", LogLevel.SUCCESS)
+                    with self._lock:
+                        self.selected_addresses.clear()
+                    self.root.after(0, self._refresh_accounts)
                 else:
-                    return False, output, error
+                    self._log_threadsafe("❌ Batch close failed", LogLevel.ERROR)
                     
-            finally:
-                try:
-                    os.unlink(script_file_path)
-                except OSError:
-                    pass
-                
-        except Exception as e:
-            return False, None, f"Batch close error: {str(e)}"
-    
-    def close_selected_accounts(self):
-        """Close the selected token accounts"""
-        if not self.selected_accounts:
-            messagebox.showwarning("No Selection", "Please select at least one account to close.")
-            return
-        
-        # Show preview of commands that will be executed
-        preview_text = self.create_command_preview()
-        
-        # Confirm with detailed preview
-        result = messagebox.askyesno(
-            "Confirm Account Closure",
-            f"Are you sure you want to close {len(self.selected_accounts)} token account(s)?\n\n"
-            "PREVIEW OF COMMANDS TO BE EXECUTED:\n"
-            f"{preview_text}\n\n"
-            "This action cannot be undone and will recover SOL from rent.\n"
-            "Make sure you have enough SOL for transaction fees."
-        )
-        
-        if not result:
-            return
-        
-        # Disable close button during operation
-        self.close_btn.config(state='disabled')
-        selected_count = len(self.selected_accounts)
-        self.log_message(f"Starting batch closure of {selected_count} accounts...", "INFO")
-        
-        # Run closure in background thread
-        def close_thread():
-            try:
-                # Get thread-safe copy of selected accounts
-                with self._lock:
-                    accounts_to_close = list(self.selected_accounts)
-                
-                # Check if we should use true batching (more than 1 account)
-                if selected_count > 1:
-                    self.root.after(0, lambda: self.log_message(
-                        f"Using BATCH PROCESSING to close {selected_count} accounts efficiently.", "INFO"))
-                    
-                    # Use batch processing with shell script
-                    success, output, error = self.run_batch_close()
-                    
-                    if success:
-                        self.root.after(0, lambda: self.log_message(
-                            f"✅ Batch closure successful! Closed {selected_count} accounts efficiently.", "SUCCESS"))
-                        success_count = selected_count
-                        failed_count = 0
-                    else:
-                        self.root.after(0, lambda: self.log_message(
-                            f"❌ Batch closure failed: {error}", "ERROR"))
-                        success_count = 0
-                        failed_count = selected_count
-                        
-                else:
-                    # Single account - use regular close
-                    account_address = accounts_to_close[0]
-                    
-                    # Validate address format
-                    if not self.is_valid_solana_address(account_address):
-                        self.root.after(0, lambda: self.log_message(
-                            f"❌ Invalid address format: {account_address[:20]}...", "ERROR"))
-                        success_count = 0
-                        failed_count = 1
-                    else:
-                        self.root.after(0, lambda addr=account_address: self.log_message(
-                            f"Closing single account: {addr[:8]}...", "INFO"))
-                        
-                        success, output, error = self.run_command(['spl-token', 'close', '--address', account_address])
-                        
-                        if success:
-                            success_count = 1
-                            failed_count = 0
-                            self.root.after(0, lambda addr=account_address: self.log_message(
-                                f"✅ Successfully closed: {addr[:8]}...", "SUCCESS"))
-                        else:
-                            success_count = 0
-                            failed_count = 1
-                            self.root.after(0, lambda addr=account_address, err=error: self.log_message(
-                                f"❌ Failed to close {addr[:8]}...: {err}", "ERROR"))
-                
-                # Final summary
-                self.root.after(0, lambda: self.log_message(
-                    f"Closure complete: {success_count} successful, {failed_count} failed", 
-                    "SUCCESS" if failed_count == 0 else "WARNING"))
-                
-                # Clear selections after successful closure
-                if success_count > 0:
-                    self.root.after(0, lambda: self.clear_selections_after_closure())
-                
-                # Refresh accounts list
-                self.root.after(0, self.refresh_accounts)
-                
-                # Re-enable close button
-                self.root.after(0, lambda: self.close_btn.config(state='normal'))
-                
             except Exception as ex:
-                err_msg = str(ex)
-                self.root.after(0, lambda msg=err_msg: self.log_message(f"Error during closure: {msg}", "ERROR"))
+                self._log_threadsafe(f"Error: {ex}", LogLevel.ERROR)
+            finally:
                 self.root.after(0, lambda: self.close_btn.config(state='normal'))
         
-        threading.Thread(target=close_thread, daemon=True).start()
+        threading.Thread(target=execute, daemon=True).start()
+    
+    def _execute_batch_close(self, addresses: List[str]) -> bool:
+        """Execute batch close using a shell script."""
+        burn = self.burn_var.get()
+        
+        # Build script content
+        lines = ["#!/bin/bash", "set -e", ""]
+        
+        if burn:
+            for addr in addresses:
+                safe = SecurityUtils.sanitize_for_shell(addr)
+                lines.append(f"spl-token burn {safe} ALL")
+        
+        for addr in addresses:
+            safe = SecurityUtils.sanitize_for_shell(addr)
+            lines.append(f"spl-token close --address {safe}")
+        
+        script_content = "\n".join(lines)
+        
+        # Execute via temp file
+        fd, path = tempfile.mkstemp(suffix='.sh', text=True)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(script_content)
+            
+            os.chmod(path, 0o700)
+            
+            timeout = 30 + (len(addresses) * 15)
+            result = CommandExecutor.run(['bash', path], timeout=timeout)
+            
+            return result.success
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
 
 def main():
-    """Main entry point"""
-    # Check if spl-token is available
-    try:
-        result = subprocess.run(['spl-token', '--version'], capture_output=True, text=True)
-        if result.returncode != 0:
-            messagebox.showerror("Error", "spl-token CLI tool not found or not working.\n"
-                               "Please install Solana CLI tools and ensure spl-token is available.")
-            return
-    except FileNotFoundError:
-        messagebox.showerror("Error", "spl-token CLI tool not found.\n"
-                           "Please install Solana CLI tools and ensure spl-token is available.")
+    """Application entry point."""
+    # Check prerequisites
+    if not CommandExecutor.check_spl_token_available():
+        messagebox.showerror(
+            "Missing Dependency",
+            "spl-token CLI not found.\n\n"
+            "Please install Solana CLI tools:\n"
+            "sh -c \"$(curl -sSfL https://release.solana.com/stable/install)\""
+        )
         return
     
-    # Create and run the application
+    # Create application
     root = tk.Tk()
     app = TokenAccountCloser(root)
     
-    # Configure window close handler
-    def on_closing():
+    # Handle close
+    def on_close():
         if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
             root.destroy()
     
-    root.protocol("WM_DELETE_WINDOW", on_closing)
-    
-    # Start the application
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
+
 if __name__ == "__main__":
-    main() 
+    main()
