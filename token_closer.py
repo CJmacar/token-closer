@@ -22,11 +22,11 @@ class TokenAccountCloser:
     # Valid Solana address pattern: Base58 characters, 32-44 chars long
     SOLANA_ADDRESS_PATTERN = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
     
-    # Token list API URLs (tried in order)
+    # Token list API URLs (tried in order - GitHub first as most accessible)
     TOKEN_LIST_URLS = [
-        "https://token.jup.ag/all",
-        "https://cache.jup.ag/tokens",
         "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json",
+        "https://cdn.jsdelivr.net/gh/solana-labs/token-list@main/src/tokens/solana.tokenlist.json",
+        "https://token.jup.ag/all",
     ]
     
     def __init__(self, root):
