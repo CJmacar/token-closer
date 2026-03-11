@@ -15,15 +15,20 @@ import os
 import tempfile
 import re
 import shlex
+import urllib.request
+import urllib.error
 
 class TokenAccountCloser:
     # Valid Solana address pattern: Base58 characters, 32-44 chars long
     SOLANA_ADDRESS_PATTERN = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
     
+    # Jupiter token list API URL
+    TOKEN_LIST_URL = "https://token.jup.ag/all"
+    
     def __init__(self, root):
         self.root = root
         self.root.title("Solana Token Account Closer")
-        self.root.geometry("900x700")
+        self.root.geometry("1100x700")  # Wider to accommodate new columns
         self.root.configure(bg='#f0f0f0')
         
         # Data storage with thread lock for safety
@@ -31,8 +36,15 @@ class TokenAccountCloser:
         self.token_accounts = []
         self.selected_accounts = set()
         
+        # Token metadata cache: mint -> {name, symbol, description}
+        self.token_metadata_cache = {}
+        self.metadata_loading = False
+        
         # Create UI
         self.create_widgets()
+        
+        # Load token metadata in background
+        self.load_token_metadata()
         
         # Load accounts on startup
         self.refresh_accounts()
@@ -48,6 +60,56 @@ class TokenAccountCloser:
     def sanitize_for_shell(value: str) -> str:
         """Sanitize a value for safe use in shell commands"""
         return shlex.quote(value)
+    
+    def load_token_metadata(self):
+        """Load token metadata from Jupiter token list API"""
+        if self.metadata_loading:
+            return
+        
+        self.metadata_loading = True
+        self.log_message("Loading token metadata...", "INFO")
+        
+        def fetch_metadata():
+            try:
+                req = urllib.request.Request(
+                    self.TOKEN_LIST_URL,
+                    headers={'User-Agent': 'TokenCloser/1.0'}
+                )
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    
+                    # Build cache from token list
+                    with self._lock:
+                        for token in data:
+                            mint = token.get('address', '')
+                            if mint:
+                                self.token_metadata_cache[mint] = {
+                                    'name': token.get('name', ''),
+                                    'symbol': token.get('symbol', ''),
+                                    'description': token.get('description', '') or token.get('name', '')
+                                }
+                    
+                    self.root.after(0, lambda: self.log_message(
+                        f"Loaded metadata for {len(self.token_metadata_cache)} tokens", "SUCCESS"))
+                    self.root.after(0, self.update_accounts_display)
+                    
+            except urllib.error.URLError as e:
+                self.root.after(0, lambda: self.log_message(
+                    f"Could not load token metadata: {e.reason}", "WARNING"))
+            except Exception as e:
+                self.root.after(0, lambda: self.log_message(
+                    f"Error loading token metadata: {str(e)}", "WARNING"))
+            finally:
+                self.metadata_loading = False
+        
+        threading.Thread(target=fetch_metadata, daemon=True).start()
+    
+    def get_token_info(self, mint: str) -> Dict[str, str]:
+        """Get token name and symbol for a mint address"""
+        with self._lock:
+            if mint in self.token_metadata_cache:
+                return self.token_metadata_cache[mint]
+        return {'name': '', 'symbol': '', 'description': ''}
     
     def create_widgets(self):
         """Create the main UI widgets"""
@@ -123,24 +185,26 @@ class TokenAccountCloser:
         list_frame.rowconfigure(0, weight=1)
         
         # Create Treeview for accounts
-        columns = ('select', 'address', 'mint', 'balance', 'decimals', 'owner')
+        columns = ('select', 'symbol', 'name', 'balance', 'address', 'mint', 'decimals')
         self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=15)
         
         # Define headings
         self.tree.heading('select', text='Select')
+        self.tree.heading('symbol', text='Ticker')
+        self.tree.heading('name', text='Token Name')
+        self.tree.heading('balance', text='Balance')
         self.tree.heading('address', text='Account Address')
         self.tree.heading('mint', text='Token Mint')
-        self.tree.heading('balance', text='Balance')
-        self.tree.heading('decimals', text='Decimals')
-        self.tree.heading('owner', text='Owner')
+        self.tree.heading('decimals', text='Dec')
         
         # Configure column widths
-        self.tree.column('select', width=60, anchor='center')
-        self.tree.column('address', width=200)
-        self.tree.column('mint', width=200)
-        self.tree.column('balance', width=100, anchor='e')
-        self.tree.column('decimals', width=80, anchor='center')
-        self.tree.column('owner', width=200)
+        self.tree.column('select', width=50, anchor='center')
+        self.tree.column('symbol', width=80, anchor='w')
+        self.tree.column('name', width=180, anchor='w')
+        self.tree.column('balance', width=120, anchor='e')
+        self.tree.column('address', width=150)
+        self.tree.column('mint', width=150)
+        self.tree.column('decimals', width=50, anchor='center')
         
         # Scrollbars
         v_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -245,21 +309,29 @@ class TokenAccountCloser:
             # Get mint address
             mint = account.get('mint', 'Unknown')
             
-            # Get owner
-            owner = account.get('owner', 'Unknown')
+            # Get token metadata (name, symbol)
+            token_info = self.get_token_info(mint)
+            symbol = token_info.get('symbol', '') or '—'
+            name = token_info.get('name', '') or '—'
+            
+            # Truncate address for display
+            address = account.get('address', 'Unknown')
+            address_display = f"{address[:8]}...{address[-6:]}" if len(address) > 20 else address
+            mint_display = f"{mint[:8]}...{mint[-6:]}" if len(mint) > 20 else mint
             
             # Insert into treeview
             item = self.tree.insert('', 'end', values=(
                 select_text,
-                account.get('address', 'Unknown'),
-                mint,
+                symbol,
+                name,
                 balance_amount,
-                decimals,
-                owner
+                address_display,
+                mint_display,
+                decimals
             ))
             
-            # Store account data in item
-            self.tree.set(item, 'select', select_text)
+            # Store full address as a tag for retrieval
+            self.tree.item(item, tags=(address,))
     
     def toggle_selection(self, event):
         """Toggle selection of an account when double-clicked"""
@@ -268,7 +340,13 @@ class TokenAccountCloser:
             return
         
         item = selection[0]
-        account_address = self.tree.item(item, 'values')[1]
+        # Get full address from tags (we store it there since display is truncated)
+        tags = self.tree.item(item, 'tags')
+        if not tags:
+            self.log_message("Could not get account address", "ERROR")
+            return
+        
+        account_address = tags[0]
         
         # Validate address format before adding to selection
         if not self.is_valid_solana_address(account_address):
