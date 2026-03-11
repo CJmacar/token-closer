@@ -12,15 +12,22 @@ import json
 import threading
 from typing import List, Dict, Optional
 import os
+import tempfile
+import re
+import shlex
 
 class TokenAccountCloser:
+    # Valid Solana address pattern: Base58 characters, 32-44 chars long
+    SOLANA_ADDRESS_PATTERN = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+    
     def __init__(self, root):
         self.root = root
         self.root.title("Solana Token Account Closer")
         self.root.geometry("900x700")
         self.root.configure(bg='#f0f0f0')
         
-        # Data storage
+        # Data storage with thread lock for safety
+        self._lock = threading.Lock()
         self.token_accounts = []
         self.selected_accounts = set()
         
@@ -29,6 +36,18 @@ class TokenAccountCloser:
         
         # Load accounts on startup
         self.refresh_accounts()
+    
+    @classmethod
+    def is_valid_solana_address(cls, address: str) -> bool:
+        """Validate that an address matches Solana's Base58 format"""
+        if not address or not isinstance(address, str):
+            return False
+        return bool(cls.SOLANA_ADDRESS_PATTERN.match(address))
+    
+    @staticmethod
+    def sanitize_for_shell(value: str) -> str:
+        """Sanitize a value for safe use in shell commands"""
+        return shlex.quote(value)
     
     def create_widgets(self):
         """Create the main UI widgets"""
@@ -244,13 +263,23 @@ class TokenAccountCloser:
     
     def toggle_selection(self, event):
         """Toggle selection of an account when double-clicked"""
-        item = self.tree.selection()[0]
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        item = selection[0]
         account_address = self.tree.item(item, 'values')[1]
         
-        if account_address in self.selected_accounts:
-            self.selected_accounts.remove(account_address)
-        else:
-            self.selected_accounts.add(account_address)
+        # Validate address format before adding to selection
+        if not self.is_valid_solana_address(account_address):
+            self.log_message(f"Invalid address format: {account_address[:20]}...", "ERROR")
+            return
+        
+        with self._lock:
+            if account_address in self.selected_accounts:
+                self.selected_accounts.remove(account_address)
+            else:
+                self.selected_accounts.add(account_address)
         
         # Update the display to show current selection state
         self.update_accounts_display()
@@ -258,17 +287,27 @@ class TokenAccountCloser:
     
     def select_all_accounts(self):
         """Select all visible accounts"""
-        self.selected_accounts.clear()
-        for account in self.token_accounts:
-            self.selected_accounts.add(account.get('address'))
+        with self._lock:
+            self.selected_accounts.clear()
+            invalid_count = 0
+            for account in self.token_accounts:
+                addr = account.get('address')
+                if self.is_valid_solana_address(addr):
+                    self.selected_accounts.add(addr)
+                else:
+                    invalid_count += 1
         
         self.update_accounts_display()
         self.update_selection_count()
-        self.log_message(f"Selected all {len(self.selected_accounts)} accounts", "INFO")
+        if invalid_count > 0:
+            self.log_message(f"Selected {len(self.selected_accounts)} accounts ({invalid_count} invalid skipped)", "WARNING")
+        else:
+            self.log_message(f"Selected all {len(self.selected_accounts)} accounts", "INFO")
     
     def deselect_all_accounts(self):
         """Deselect all accounts"""
-        self.selected_accounts.clear()
+        with self._lock:
+            self.selected_accounts.clear()
         self.update_accounts_display()
         self.update_selection_count()
         self.log_message("Deselected all accounts", "INFO")
@@ -558,7 +597,8 @@ class TokenAccountCloser:
     
     def clear_selections_after_closure(self):
         """Clear all selections after successful account closure"""
-        self.selected_accounts.clear()
+        with self._lock:
+            self.selected_accounts.clear()
         self.update_selection_count()
         self.update_accounts_display()
         self.log_message("✅ Selections cleared after successful closure", "INFO")
@@ -571,17 +611,21 @@ class TokenAccountCloser:
     def run_batch_close(self):
         """Execute a batch close operation using shell script for reliability"""
         try:
-            # Use shell script approach for batch operations
-            # This provides better error handling, logging, and progress tracking
+            # Validate all addresses before proceeding
+            with self._lock:
+                accounts_to_process = list(self.selected_accounts)
+            
+            for addr in accounts_to_process:
+                if not self.is_valid_solana_address(addr):
+                    return False, None, f"Invalid Solana address format: {addr[:20]}..."
+            
             self.log_message("Using shell script approach for batch operations...", "INFO")
             
-            # Create a shell script that executes all close commands in sequence
-            # This is not true batching but provides better error handling and logging
             script_content = "#!/bin/bash\n"
-            script_content += "set -e\n"  # Exit on any error
+            script_content += "set -e\n"
             script_content += "echo '🚀 Starting batch operation...'\n"
-            script_content += "echo '📊 Total accounts to process: " + str(len(self.selected_accounts)) + "'\n"
-            script_content += "echo '⏱️  Estimated time: " + str(len(self.selected_accounts) * 5) + " seconds'\n"
+            script_content += f"echo '📊 Total accounts to process: {len(accounts_to_process)}'\n"
+            script_content += f"echo '⏱️  Estimated time: {len(accounts_to_process) * 5} seconds'\n"
             script_content += "echo ''\n"
             
             if self.burn_before_close_var.get():
@@ -589,10 +633,12 @@ class TokenAccountCloser:
                 script_content += "echo 'This will burn all tokens before closing accounts to maximize SOL recovery'\n"
                 script_content += "echo ''\n"
                 
-                for i, account_address in enumerate(self.selected_accounts, 1):
-                    script_content += f"echo '🔥 [{i}/{len(self.selected_accounts)}] Burning tokens in: {account_address[:8]}...'\n"
-                    script_content += f"spl-token burn {account_address} ALL\n"
-                    script_content += f"echo '✅ [{i}/{len(self.selected_accounts)}] Tokens burned successfully'\n"
+                for i, account_address in enumerate(accounts_to_process, 1):
+                    safe_addr = self.sanitize_for_shell(account_address)
+                    display_addr = account_address[:8]
+                    script_content += f"echo '🔥 [{i}/{len(accounts_to_process)}] Burning tokens in: {display_addr}...'\n"
+                    script_content += f"spl-token burn {safe_addr} ALL\n"
+                    script_content += f"echo '✅ [{i}/{len(accounts_to_process)}] Tokens burned successfully'\n"
                     script_content += "echo ''\n"
                 
                 script_content += "echo '🔥 All tokens burned successfully!'\n"
@@ -602,34 +648,34 @@ class TokenAccountCloser:
             script_content += "echo '🗑️ Starting batch closure...'\n"
             script_content += "echo ''\n"
             
-            for i, account_address in enumerate(self.selected_accounts, 1):
-                script_content += f"echo '🗑️ [{i}/{len(self.selected_accounts)}] Closing account: {account_address[:8]}...'\n"
-                script_content += f"spl-token close --address {account_address}\n"
-                script_content += f"echo '✅ [{i}/{len(self.selected_accounts)}] Account closed successfully'\n"
+            for i, account_address in enumerate(accounts_to_process, 1):
+                safe_addr = self.sanitize_for_shell(account_address)
+                display_addr = account_address[:8]
+                script_content += f"echo '🗑️ [{i}/{len(accounts_to_process)}] Closing account: {display_addr}...'\n"
+                script_content += f"spl-token close --address {safe_addr}\n"
+                script_content += f"echo '✅ [{i}/{len(accounts_to_process)}] Account closed successfully'\n"
                 script_content += "echo ''\n"
             
             script_content += "echo '🎉 All accounts closed successfully!'\n"
             script_content += "echo ''\n"
             script_content += "echo '📊 FINAL SUMMARY:'\n"
-            script_content += "echo '   ✅ Total accounts processed: " + str(len(self.selected_accounts)) + "'\n"
+            script_content += f"echo '   ✅ Total accounts processed: {len(accounts_to_process)}'\n"
             if self.burn_before_close_var.get():
-                script_content += "echo '   🔥 Tokens burned: " + str(len(self.selected_accounts)) + " accounts'\n"
-            script_content += "echo '   🗑️  Accounts closed: " + str(len(self.selected_accounts)) + "'\n"
+                script_content += f"echo '   🔥 Tokens burned: {len(accounts_to_process)} accounts'\n"
+            script_content += f"echo '   🗑️  Accounts closed: {len(accounts_to_process)}'\n"
             script_content += "echo '   💰 SOL recovered from rent'\n"
             script_content += "echo '   🎯 Operation completed successfully!'\n"
             
-            # Write script to temporary file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as script_file:
-                script_file.write(script_content)
-                script_file_path = script_file.name
-            
+            # Create temp file with restrictive permissions (owner read/write only initially)
+            fd, script_file_path = tempfile.mkstemp(suffix='.sh', text=True)
             try:
-                # Make script executable and run it
-                os.chmod(script_file_path, 0o755)
+                with os.fdopen(fd, 'w') as script_file:
+                    script_file.write(script_content)
                 
-                # Execute the script with extended timeout for batch operations
-                # Calculate timeout: 30 seconds base + 10 seconds per account
-                batch_timeout = 30 + (len(self.selected_accounts) * 10)
+                # Set executable only for owner (0o700)
+                os.chmod(script_file_path, 0o700)
+                
+                batch_timeout = 30 + (len(accounts_to_process) * 10)
                 self.log_message(f"Executing batch script with {batch_timeout}s timeout...", "INFO")
                 
                 success, output, error = self.run_command(['bash', script_file_path], timeout=batch_timeout)
@@ -641,7 +687,10 @@ class TokenAccountCloser:
                     return False, output, error
                     
             finally:
-                os.unlink(script_file_path)
+                try:
+                    os.unlink(script_file_path)
+                except OSError:
+                    pass
                 
         except Exception as e:
             return False, None, f"Batch close error: {str(e)}"
@@ -676,6 +725,10 @@ class TokenAccountCloser:
         # Run closure in background thread
         def close_thread():
             try:
+                # Get thread-safe copy of selected accounts
+                with self._lock:
+                    accounts_to_close = list(self.selected_accounts)
+                
                 # Check if we should use true batching (more than 1 account)
                 if selected_count > 1:
                     self.root.after(0, lambda: self.log_message(
@@ -697,22 +750,30 @@ class TokenAccountCloser:
                         
                 else:
                     # Single account - use regular close
-                    self.root.after(0, lambda: self.log_message(
-                        f"Closing single account: {list(self.selected_accounts)[0][:8]}...", "INFO"))
+                    account_address = accounts_to_close[0]
                     
-                    account_address = list(self.selected_accounts)[0]
-                    success, output, error = self.run_command(['spl-token', 'close', '--address', account_address])
-                    
-                    if success:
-                        success_count = 1
-                        failed_count = 0
+                    # Validate address format
+                    if not self.is_valid_solana_address(account_address):
                         self.root.after(0, lambda: self.log_message(
-                            f"✅ Successfully closed: {account_address[:8]}...", "SUCCESS"))
-                    else:
+                            f"❌ Invalid address format: {account_address[:20]}...", "ERROR"))
                         success_count = 0
                         failed_count = 1
-                        self.root.after(0, lambda: self.log_message(
-                            f"❌ Failed to close {account_address[:8]}...: {error}", "ERROR"))
+                    else:
+                        self.root.after(0, lambda addr=account_address: self.log_message(
+                            f"Closing single account: {addr[:8]}...", "INFO"))
+                        
+                        success, output, error = self.run_command(['spl-token', 'close', '--address', account_address])
+                        
+                        if success:
+                            success_count = 1
+                            failed_count = 0
+                            self.root.after(0, lambda addr=account_address: self.log_message(
+                                f"✅ Successfully closed: {addr[:8]}...", "SUCCESS"))
+                        else:
+                            success_count = 0
+                            failed_count = 1
+                            self.root.after(0, lambda addr=account_address, err=error: self.log_message(
+                                f"❌ Failed to close {addr[:8]}...: {err}", "ERROR"))
                 
                 # Final summary
                 self.root.after(0, lambda: self.log_message(
