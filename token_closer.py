@@ -79,6 +79,7 @@ class TokenAccountCloser:
                     data = json.loads(response.read().decode('utf-8'))
                     
                     # Build cache from token list
+                    count = 0
                     with self._lock:
                         for token in data:
                             mint = token.get('address', '')
@@ -88,17 +89,23 @@ class TokenAccountCloser:
                                     'symbol': token.get('symbol', ''),
                                     'description': token.get('description', '') or token.get('name', '')
                                 }
+                                count += 1
                     
-                    self.root.after(0, lambda: self.log_message(
-                        f"Loaded metadata for {len(self.token_metadata_cache)} tokens", "SUCCESS"))
+                    # Capture count for lambda
+                    final_count = count
+                    self.root.after(0, lambda c=final_count: self.log_message(
+                        f"Loaded metadata for {c} tokens", "SUCCESS"))
                     self.root.after(0, self.update_accounts_display)
                     
-            except urllib.error.URLError as e:
-                self.root.after(0, lambda: self.log_message(
-                    f"Could not load token metadata: {e.reason}", "WARNING"))
-            except Exception as e:
-                self.root.after(0, lambda: self.log_message(
-                    f"Error loading token metadata: {str(e)}", "WARNING"))
+            except urllib.error.URLError as ex:
+                # Capture error message before lambda (exception var is deleted after block)
+                error_msg = str(ex.reason) if hasattr(ex, 'reason') else str(ex)
+                self.root.after(0, lambda msg=error_msg: self.log_message(
+                    f"Could not load token metadata: {msg}", "WARNING"))
+            except Exception as ex:
+                error_msg = str(ex)
+                self.root.after(0, lambda msg=error_msg: self.log_message(
+                    f"Error loading token metadata: {msg}", "WARNING"))
             finally:
                 self.metadata_loading = False
         
@@ -275,17 +282,20 @@ class TokenAccountCloser:
                     try:
                         accounts_data = json.loads(output)
                         self.token_accounts = accounts_data.get('accounts', [])
+                        num_accounts = len(self.token_accounts)
                         self.root.after(0, self.update_accounts_display)
-                        self.root.after(0, lambda: self.log_message(f"Found {len(self.token_accounts)} token accounts", "SUCCESS"))
+                        self.root.after(0, lambda n=num_accounts: self.log_message(f"Found {n} token accounts", "SUCCESS"))
                     except json.JSONDecodeError:
                         self.root.after(0, lambda: self.log_message("Failed to parse accounts data", "ERROR"))
                 else:
-                    self.root.after(0, lambda: self.log_message(f"Failed to get accounts: {error}", "ERROR"))
+                    err_msg = str(error)
+                    self.root.after(0, lambda msg=err_msg: self.log_message(f"Failed to get accounts: {msg}", "ERROR"))
                 
                 self.root.after(0, lambda: self.refresh_btn.config(state='normal'))
                 
-            except Exception as e:
-                self.root.after(0, lambda: self.log_message(f"Error refreshing accounts: {str(e)}", "ERROR"))
+            except Exception as ex:
+                err_msg = str(ex)
+                self.root.after(0, lambda msg=err_msg: self.log_message(f"Error refreshing accounts: {msg}", "ERROR"))
                 self.root.after(0, lambda: self.refresh_btn.config(state='normal'))
         
         threading.Thread(target=refresh_thread, daemon=True).start()
@@ -868,8 +878,9 @@ class TokenAccountCloser:
                 # Re-enable close button
                 self.root.after(0, lambda: self.close_btn.config(state='normal'))
                 
-            except Exception as e:
-                self.root.after(0, lambda: self.log_message(f"Error during closure: {str(e)}", "ERROR"))
+            except Exception as ex:
+                err_msg = str(ex)
+                self.root.after(0, lambda msg=err_msg: self.log_message(f"Error during closure: {msg}", "ERROR"))
                 self.root.after(0, lambda: self.close_btn.config(state='normal'))
         
         threading.Thread(target=close_thread, daemon=True).start()
