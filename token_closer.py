@@ -118,6 +118,62 @@ class TokenAccountCloser:
                 return self.token_metadata_cache[mint]
         return {'name': '', 'symbol': '', 'description': ''}
     
+    def fetch_token_metadata_cli(self, mint: str) -> Optional[Dict[str, str]]:
+        """Fetch token metadata using spl-token display command (fallback)"""
+        if not self.is_valid_solana_address(mint):
+            return None
+        
+        try:
+            success, output, error = self.run_command(
+                ['spl-token', 'display', mint], timeout=10
+            )
+            if success and output:
+                # Parse the output for name/symbol
+                name = ''
+                symbol = ''
+                for line in output.split('\n'):
+                    if 'Name:' in line:
+                        name = line.split('Name:')[-1].strip()
+                    elif 'Symbol:' in line:
+                        symbol = line.split('Symbol:')[-1].strip()
+                
+                if name or symbol:
+                    return {'name': name, 'symbol': symbol, 'description': name}
+        except Exception:
+            pass
+        return None
+    
+    def load_missing_metadata(self):
+        """Load metadata for tokens not in the cache using CLI (fallback)"""
+        def fetch_missing():
+            mints_to_fetch = set()
+            for account in self.token_accounts:
+                mint = account.get('mint', '')
+                with self._lock:
+                    if mint and mint not in self.token_metadata_cache:
+                        mints_to_fetch.add(mint)
+            
+            if not mints_to_fetch:
+                return
+            
+            self.root.after(0, lambda n=len(mints_to_fetch): self.log_message(
+                f"Fetching metadata for {n} unknown tokens...", "INFO"))
+            
+            fetched = 0
+            for mint in mints_to_fetch:
+                info = self.fetch_token_metadata_cli(mint)
+                if info:
+                    with self._lock:
+                        self.token_metadata_cache[mint] = info
+                    fetched += 1
+            
+            if fetched > 0:
+                self.root.after(0, lambda n=fetched: self.log_message(
+                    f"Fetched metadata for {n} additional tokens", "SUCCESS"))
+                self.root.after(0, self.update_accounts_display)
+        
+        threading.Thread(target=fetch_missing, daemon=True).start()
+    
     def create_widgets(self):
         """Create the main UI widgets"""
         # Main frame
@@ -285,6 +341,8 @@ class TokenAccountCloser:
                         num_accounts = len(self.token_accounts)
                         self.root.after(0, self.update_accounts_display)
                         self.root.after(0, lambda n=num_accounts: self.log_message(f"Found {n} token accounts", "SUCCESS"))
+                        # Try to load metadata for any unknown tokens
+                        self.root.after(500, self.load_missing_metadata)
                     except json.JSONDecodeError:
                         self.root.after(0, lambda: self.log_message("Failed to parse accounts data", "ERROR"))
                 else:
