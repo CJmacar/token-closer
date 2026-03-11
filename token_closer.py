@@ -670,6 +670,11 @@ class TokenAccountCloser:
         self.tree.bind('<Double-1>', self._on_row_double_click)
         self.tree.bind('<Return>', self._on_row_double_click)
         self.tree.bind('<space>', self._on_row_double_click)
+        
+        # Right-click context menu
+        self.tree.bind('<Button-3>', self._on_right_click)  # Windows/Linux
+        self.tree.bind('<Button-2>', self._on_right_click)  # macOS
+        self._create_context_menu()
     
     def _create_log_panel(self, parent: ttk.Frame) -> None:
         """Create the log panel."""
@@ -847,6 +852,82 @@ class TokenAccountCloser:
         
         for index, (val, item) in enumerate(items):
             self.tree.move(item, '', index)
+    
+    # -------------------------------------------------------------------------
+    # Context Menu (Right-Click)
+    # -------------------------------------------------------------------------
+    
+    def _create_context_menu(self) -> None:
+        """Create the right-click context menu."""
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="📋 Copy Ticker", command=lambda: self._copy_column('symbol'))
+        self.context_menu.add_command(label="📋 Copy Token Name", command=lambda: self._copy_column('name'))
+        self.context_menu.add_command(label="📋 Copy Balance", command=lambda: self._copy_column('balance'))
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="📋 Copy Account Address (Full)", command=self._copy_full_address)
+        self.context_menu.add_command(label="📋 Copy Mint Address (Full)", command=self._copy_full_mint)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="☑ Toggle Selection", command=self._toggle_selected_row)
+    
+    def _on_right_click(self, event) -> None:
+        """Handle right-click to show context menu."""
+        # Select the row under cursor
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+            # Show context menu
+            try:
+                self.context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.context_menu.grab_release()
+    
+    def _copy_to_clipboard(self, text: str) -> None:
+        """Copy text to system clipboard."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()  # Required for clipboard to persist
+        self._log(f"Copied: {text[:50]}{'...' if len(text) > 50 else ''}")
+    
+    def _copy_column(self, col: str) -> None:
+        """Copy the value of a specific column from selected row."""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        value = self.tree.set(selection[0], col)
+        if value and value != "—":
+            self._copy_to_clipboard(value)
+    
+    def _copy_full_address(self) -> None:
+        """Copy the full (non-truncated) account address."""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        tags = self.tree.item(selection[0], 'tags')
+        if tags:
+            self._copy_to_clipboard(tags[0])
+    
+    def _copy_full_mint(self) -> None:
+        """Copy the full (non-truncated) mint address."""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        tags = self.tree.item(selection[0], 'tags')
+        if tags:
+            address = tags[0]
+            account = self._get_account_by_address(address)
+            if account:
+                self._copy_to_clipboard(account.mint)
+    
+    def _toggle_selected_row(self) -> None:
+        """Toggle selection of the currently focused row."""
+        selection = self.tree.selection()
+        if selection:
+            # Simulate double-click event
+            self._on_row_double_click(None)
     
     # -------------------------------------------------------------------------
     # Selection Handling
