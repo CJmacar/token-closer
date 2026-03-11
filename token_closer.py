@@ -1444,6 +1444,26 @@ class WebInterface:
             color: var(--accent);
         }
         
+        .token-link {
+            color: var(--accent);
+            text-decoration: none;
+            transition: var(--transition);
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .token-link:hover {
+            color: #9945ff;
+            text-decoration: underline;
+        }
+        
+        .token-link::after {
+            content: '↗';
+            font-size: 0.7em;
+            opacity: 0.6;
+        }
+        
         .balance {
             font-family: 'JetBrains Mono', 'Fira Code', monospace;
             color: var(--success);
@@ -1716,12 +1736,11 @@ class WebInterface:
                         <th onclick="sortTable('balance')">Balance</th>
                         <th onclick="sortTable('address')">Account</th>
                         <th onclick="sortTable('mint')">Mint</th>
-                        <th onclick="sortTable('decimals')">Dec</th>
                     </tr>
                 </thead>
                 <tbody id="accounts-table">
                     <tr>
-                        <td colspan="7">
+                        <td colspan="6">
                             <div class="loading">
                                 <div class="spinner"></div>
                                 <span>Loading accounts...</span>
@@ -1816,20 +1835,24 @@ class WebInterface:
         function renderAccounts() {
             const tbody = document.getElementById('accounts-table');
             if (accounts.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state"><div class="empty-state-icon">📭</div><p>No token accounts found</p></div></td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><div class="empty-state-icon">📭</div><p>No token accounts found</p></div></td></tr>';
                 return;
             }
             
             tbody.innerHTML = accounts.map(acc => {
                 const selected = selectedAddresses.has(acc.address);
+                const symbol = acc.symbol || '—';
+                const tokenLink = 'https://birdeye.so/token/' + acc.mint + '?chain=solana';
+                const symbolHtml = symbol !== '—' 
+                    ? '<a href="' + tokenLink + '" target="_blank" rel="noopener" class="token-link" title="View on Birdeye">' + symbol + '</a>'
+                    : symbol;
                 return '<tr class="' + (selected ? 'selected' : '') + '" data-address="' + acc.address + '">' +
                     '<td class="checkbox-cell"><input type="checkbox" ' + (selected ? 'checked' : '') + ' onchange="toggleAccount(\\'' + acc.address + '\\')"></td>' +
-                    '<td class="symbol">' + (acc.symbol || '—') + '</td>' +
+                    '<td class="symbol">' + symbolHtml + '</td>' +
                     '<td>' + (acc.name || '—') + '</td>' +
                     '<td class="balance">' + acc.balance + '</td>' +
                     '<td class="address">' + truncateAddress(acc.address) + '</td>' +
                     '<td class="address">' + truncateAddress(acc.mint) + '</td>' +
-                    '<td>' + acc.decimals + '</td>' +
                 '</tr>';
             }).join('');
             
