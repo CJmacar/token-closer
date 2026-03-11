@@ -2175,14 +2175,18 @@ class WebInterface:
         with self._lock:
             return [a.mint for a in self.accounts if not self.metadata_service.has(a.mint)]
     
-    def _fetch_metadata_batch(self, mints: List[str], batch_size: int = 5) -> int:
+    def _fetch_metadata_batch(self, mints: List[str], batch_size: int = 3) -> int:
         """Fetch metadata for a batch of mints. Returns count fetched."""
         to_fetch = [m for m in mints[:batch_size] if SecurityUtils.is_valid_solana_address(m)]
         fetched = 0
         
         for mint in to_fetch:
-            metadata = self.metadata_service.fetch_from_cli(mint) or \
-                       self.metadata_service.fetch_from_dexscreener(mint)
+            # Try sources in order: CLI -> DexScreener -> Metaplex (on-chain)
+            metadata = (
+                self.metadata_service.fetch_from_cli(mint) or
+                self.metadata_service.fetch_from_dexscreener(mint) or
+                self.metadata_service.fetch_from_metaplex(mint)
+            )
             if metadata:
                 self.metadata_service.set(mint, metadata)
                 fetched += 1
