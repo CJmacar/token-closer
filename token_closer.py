@@ -22,8 +22,12 @@ class TokenAccountCloser:
     # Valid Solana address pattern: Base58 characters, 32-44 chars long
     SOLANA_ADDRESS_PATTERN = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
     
-    # Jupiter token list API URL
-    TOKEN_LIST_URL = "https://token.jup.ag/all"
+    # Token list API URLs (tried in order)
+    TOKEN_LIST_URLS = [
+        "https://token.jup.ag/all",
+        "https://cache.jup.ag/tokens",
+        "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json",
+    ]
     
     def __init__(self, root):
         self.root = root
@@ -62,7 +66,7 @@ class TokenAccountCloser:
         return shlex.quote(value)
     
     def load_token_metadata(self):
-        """Load token metadata from Jupiter token list API"""
+        """Load token metadata from token list APIs (tries multiple sources)"""
         if self.metadata_loading:
             return
         
@@ -70,44 +74,59 @@ class TokenAccountCloser:
         self.log_message("Loading token metadata...", "INFO")
         
         def fetch_metadata():
-            try:
-                req = urllib.request.Request(
-                    self.TOKEN_LIST_URL,
-                    headers={'User-Agent': 'TokenCloser/1.0'}
-                )
-                with urllib.request.urlopen(req, timeout=30) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-                    
-                    # Build cache from token list
-                    count = 0
-                    with self._lock:
-                        for token in data:
-                            mint = token.get('address', '')
-                            if mint:
-                                self.token_metadata_cache[mint] = {
-                                    'name': token.get('name', ''),
-                                    'symbol': token.get('symbol', ''),
-                                    'description': token.get('description', '') or token.get('name', '')
-                                }
-                                count += 1
-                    
-                    # Capture count for lambda
-                    final_count = count
-                    self.root.after(0, lambda c=final_count: self.log_message(
-                        f"Loaded metadata for {c} tokens", "SUCCESS"))
-                    self.root.after(0, self.update_accounts_display)
-                    
-            except urllib.error.URLError as ex:
-                # Capture error message before lambda (exception var is deleted after block)
-                error_msg = str(ex.reason) if hasattr(ex, 'reason') else str(ex)
-                self.root.after(0, lambda msg=error_msg: self.log_message(
-                    f"Could not load token metadata: {msg}", "WARNING"))
-            except Exception as ex:
-                error_msg = str(ex)
-                self.root.after(0, lambda msg=error_msg: self.log_message(
-                    f"Error loading token metadata: {msg}", "WARNING"))
-            finally:
-                self.metadata_loading = False
+            last_error = None
+            
+            for url in self.TOKEN_LIST_URLS:
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={'User-Agent': 'TokenCloser/1.0'}
+                    )
+                    with urllib.request.urlopen(req, timeout=15) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                        
+                        # Handle different response formats
+                        tokens = data
+                        if isinstance(data, dict):
+                            # Solana token list format has tokens under 'tokens' key
+                            tokens = data.get('tokens', data.get('data', []))
+                        
+                        if not isinstance(tokens, list):
+                            continue
+                        
+                        # Build cache from token list
+                        count = 0
+                        with self._lock:
+                            for token in tokens:
+                                mint = token.get('address', '')
+                                if mint:
+                                    self.token_metadata_cache[mint] = {
+                                        'name': token.get('name', ''),
+                                        'symbol': token.get('symbol', ''),
+                                        'description': token.get('description', '') or token.get('name', '')
+                                    }
+                                    count += 1
+                        
+                        if count > 0:
+                            final_count = count
+                            self.root.after(0, lambda c=final_count: self.log_message(
+                                f"Loaded metadata for {c} tokens", "SUCCESS"))
+                            self.root.after(0, self.update_accounts_display)
+                            self.metadata_loading = False
+                            return  # Success - stop trying other URLs
+                            
+                except urllib.error.URLError as ex:
+                    last_error = str(ex.reason) if hasattr(ex, 'reason') else str(ex)
+                except Exception as ex:
+                    last_error = str(ex)
+            
+            # All URLs failed
+            if last_error:
+                err = last_error
+                self.root.after(0, lambda msg=err: self.log_message(
+                    f"Could not load token metadata (will use CLI fallback): {msg}", "WARNING"))
+            
+            self.metadata_loading = False
         
         threading.Thread(target=fetch_metadata, daemon=True).start()
     
