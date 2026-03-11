@@ -138,7 +138,7 @@ class TokenAccountCloser:
         return {'name': '', 'symbol': '', 'description': ''}
     
     def fetch_token_metadata_cli(self, mint: str) -> Optional[Dict[str, str]]:
-        """Fetch token metadata using spl-token display command (fallback)"""
+        """Fetch token metadata using spl-token display command"""
         if not self.is_valid_solana_address(mint):
             return None
         
@@ -147,7 +147,6 @@ class TokenAccountCloser:
                 ['spl-token', 'display', mint], timeout=10
             )
             if success and output:
-                # Parse the output for name/symbol
                 name = ''
                 symbol = ''
                 for line in output.split('\n'):
@@ -162,8 +161,38 @@ class TokenAccountCloser:
             pass
         return None
     
+    def fetch_token_metadata_dexscreener(self, mint: str) -> Optional[Dict[str, str]]:
+        """Fetch token metadata from DexScreener API"""
+        if not self.is_valid_solana_address(mint):
+            return None
+        
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'TokenCloser/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                pairs = data.get('pairs', [])
+                if pairs:
+                    # Get info from first pair's base token
+                    base_token = pairs[0].get('baseToken', {})
+                    if base_token.get('address', '').lower() == mint.lower():
+                        name = base_token.get('name', '')
+                        symbol = base_token.get('symbol', '')
+                        if name or symbol:
+                            return {'name': name, 'symbol': symbol, 'description': name}
+                    # Check quote token too
+                    quote_token = pairs[0].get('quoteToken', {})
+                    if quote_token.get('address', '').lower() == mint.lower():
+                        name = quote_token.get('name', '')
+                        symbol = quote_token.get('symbol', '')
+                        if name or symbol:
+                            return {'name': name, 'symbol': symbol, 'description': name}
+        except Exception:
+            pass
+        return None
+    
     def load_missing_metadata(self):
-        """Load metadata for tokens not in the cache using CLI (fallback)"""
+        """Load metadata for tokens not in the cache using multiple fallbacks"""
         def fetch_missing():
             mints_to_fetch = set()
             for account in self.token_accounts:
@@ -180,16 +209,27 @@ class TokenAccountCloser:
             
             fetched = 0
             for mint in mints_to_fetch:
+                info = None
+                
+                # Try CLI first (fastest, works offline)
                 info = self.fetch_token_metadata_cli(mint)
+                
+                # Try DexScreener for trading tokens
+                if not info:
+                    info = self.fetch_token_metadata_dexscreener(mint)
+                
                 if info:
                     with self._lock:
                         self.token_metadata_cache[mint] = info
                     fetched += 1
+                    # Update display periodically as we fetch
+                    if fetched % 5 == 0:
+                        self.root.after(0, self.update_accounts_display)
             
             if fetched > 0:
                 self.root.after(0, lambda n=fetched: self.log_message(
                     f"Fetched metadata for {n} additional tokens", "SUCCESS"))
-                self.root.after(0, self.update_accounts_display)
+            self.root.after(0, self.update_accounts_display)
         
         threading.Thread(target=fetch_missing, daemon=True).start()
     
