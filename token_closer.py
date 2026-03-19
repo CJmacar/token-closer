@@ -1715,19 +1715,19 @@ class WebInterface:
         
         <div class="toolbar">
             <div class="btn-group">
-                <button class="btn-primary" onclick="refreshAccounts()">
+                <button class="btn-primary" id="refresh-btn">
                     <span>⟳</span> Refresh
                 </button>
-                <button class="btn-secondary" onclick="selectAll()">
+                <button class="btn-secondary" id="select-all-btn">
                     <span>☑</span> Select All
                 </button>
-                <button class="btn-secondary" onclick="deselectAll()">
+                <button class="btn-secondary" id="clear-selection-btn">
                     <span>☐</span> Clear
                 </button>
-                <button class="btn-secondary" onclick="showPreview()">
+                <button class="btn-secondary" id="preview-btn">
                     <span>📋</span> Preview
                 </button>
-                <button class="btn-secondary" onclick="showDryRun()">
+                <button class="btn-secondary" id="dry-run-btn">
                     <span>🧪</span> Dry Run
                 </button>
             </div>
@@ -1736,7 +1736,7 @@ class WebInterface:
                     <input type="checkbox" id="burn-checkbox">
                     <span>🔥 Burn tokens first</span>
                 </label>
-                <button class="btn-danger" id="close-btn" onclick="closeSelected()" disabled>
+                <button class="btn-danger" id="close-btn" disabled>
                     <span>🗑️</span> Close Selected
                 </button>
             </div>
@@ -1747,13 +1747,13 @@ class WebInterface:
                 <thead>
                     <tr>
                         <th class="checkbox-cell">
-                            <input type="checkbox" id="select-all-checkbox" onchange="toggleSelectAll()">
+                            <input type="checkbox" id="select-all-checkbox">
                         </th>
-                        <th onclick="sortTable('symbol')">Ticker</th>
-                        <th onclick="sortTable('name')">Token Name</th>
-                        <th onclick="sortTable('balance')">Balance</th>
-                        <th onclick="sortTable('address')">Account</th>
-                        <th onclick="sortTable('mint')">Mint</th>
+                        <th class="sortable-col" data-sort="symbol">Ticker</th>
+                        <th class="sortable-col" data-sort="name">Token Name</th>
+                        <th class="sortable-col" data-sort="balance">Balance</th>
+                        <th class="sortable-col" data-sort="address">Account</th>
+                        <th class="sortable-col" data-sort="mint">Mint</th>
                     </tr>
                 </thead>
                 <tbody id="accounts-table">
@@ -1772,23 +1772,23 @@ class WebInterface:
         <div class="log-panel">
             <div class="log-header">
                 <h3>Activity Log</h3>
-                <button class="btn-secondary" onclick="clearLog()" style="padding: 6px 12px; font-size: 0.75rem;">Clear</button>
+                <button class="btn-secondary" id="clear-log-btn" style="padding: 6px 12px; font-size: 0.75rem;">Clear</button>
             </div>
             <div class="log-content" id="log-content"></div>
         </div>
     </div>
     
-    <div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
-        <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-overlay" id="modal-overlay">
+        <div class="modal">
             <div class="modal-header">
                 <h2 id="modal-title">Modal Title</h2>
-                <button class="modal-close" onclick="closeModal()">&times;</button>
+                <button class="modal-close" id="modal-close-btn">&times;</button>
             </div>
             <div class="modal-body">
                 <pre id="modal-content"></pre>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary" onclick="closeModal()">Close</button>
+                <button class="btn-secondary" id="modal-footer-close-btn">Close</button>
             </div>
         </div>
     </div>
@@ -1797,14 +1797,14 @@ class WebInterface:
         <div class="modal">
             <div class="modal-header">
                 <h2>Confirm Action</h2>
-                <button class="modal-close" onclick="closeConfirm()">&times;</button>
+                <button class="modal-close" id="confirm-close-btn">&times;</button>
             </div>
             <div class="modal-body">
                 <p id="confirm-message"></p>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary" onclick="closeConfirm()">Cancel</button>
-                <button class="btn-danger" id="confirm-btn" onclick="confirmAction()">Confirm</button>
+                <button class="btn-secondary" id="confirm-cancel-btn">Cancel</button>
+                <button class="btn-danger" id="confirm-btn">Confirm</button>
             </div>
         </div>
     </div>
@@ -1866,14 +1866,14 @@ class WebInterface:
                     : symbol;
                 const accountCell = '<span class="address-wrap">' +
                     '<span>' + truncateAddress(acc.address) + '</span>' +
-                    '<a href="#" class="copy-link" onclick="copyAddress(event, \\'' + acc.address + '\\', \'Account address\')" title="Copy full account address">📋</a>' +
+                    '<a href="#" class="copy-link" data-copy="' + acc.address + '" data-label="Account address" title="Copy full account address">📋</a>' +
                     '</span>';
                 const mintCell = '<span class="address-wrap">' +
                     '<span>' + truncateAddress(acc.mint) + '</span>' +
-                    '<a href="#" class="copy-link" onclick="copyAddress(event, \\'' + acc.mint + '\\', \'Contract address\')" title="Copy full contract address">📋</a>' +
+                    '<a href="#" class="copy-link" data-copy="' + acc.mint + '" data-label="Contract address" title="Copy full contract address">📋</a>' +
                     '</span>';
                 return '<tr class="' + (selected ? 'selected' : '') + '" data-address="' + acc.address + '">' +
-                    '<td class="checkbox-cell"><input type="checkbox" ' + (selected ? 'checked' : '') + ' onchange="toggleAccount(\\'' + acc.address + '\\')"></td>' +
+                    '<td class="checkbox-cell"><input type="checkbox" class="row-toggle" data-address="' + acc.address + '" ' + (selected ? 'checked' : '') + '></td>' +
                     '<td class="symbol">' + symbolHtml + '</td>' +
                     '<td>' + (acc.name || '—') + '</td>' +
                     '<td class="balance">' + acc.balance + '</td>' +
@@ -2105,15 +2105,56 @@ class WebInterface:
             document.getElementById('log-content').innerHTML = '';
         }
         
-        function sortTable(column) {
+        window.sortTable = function(column) {
             accounts.sort((a, b) => {
                 const valA = (a[column] || '').toString().toLowerCase();
                 const valB = (b[column] || '').toString().toLowerCase();
                 return valA.localeCompare(valB, undefined, {numeric: true});
             });
             renderAccounts();
-        }
+        };
         
+        function setupEventListeners() {
+            document.getElementById('refresh-btn').addEventListener('click', refreshAccounts);
+            document.getElementById('select-all-btn').addEventListener('click', selectAll);
+            document.getElementById('clear-selection-btn').addEventListener('click', deselectAll);
+            document.getElementById('preview-btn').addEventListener('click', showPreview);
+            document.getElementById('dry-run-btn').addEventListener('click', showDryRun);
+            document.getElementById('close-btn').addEventListener('click', closeSelected);
+            document.getElementById('select-all-checkbox').addEventListener('change', toggleSelectAll);
+            document.getElementById('clear-log-btn').addEventListener('click', clearLog);
+            document.getElementById('modal-close-btn').addEventListener('click', closeModal);
+            document.getElementById('modal-footer-close-btn').addEventListener('click', closeModal);
+            document.getElementById('confirm-close-btn').addEventListener('click', closeConfirm);
+            document.getElementById('confirm-cancel-btn').addEventListener('click', closeConfirm);
+            document.getElementById('confirm-btn').addEventListener('click', confirmAction);
+
+            document.querySelectorAll('.sortable-col').forEach((header) => {
+                header.addEventListener('click', () => sortTable(header.dataset.sort));
+            });
+
+            const accountsTable = document.getElementById('accounts-table');
+            accountsTable.addEventListener('change', (event) => {
+                const toggle = event.target.closest('.row-toggle');
+                if (toggle) {
+                    toggleAccount(toggle.dataset.address);
+                }
+            });
+            accountsTable.addEventListener('click', (event) => {
+                const copyLink = event.target.closest('.copy-link');
+                if (copyLink) {
+                    copyAddress(event, copyLink.dataset.copy, copyLink.dataset.label);
+                }
+            });
+
+            const modalOverlay = document.getElementById('modal-overlay');
+            modalOverlay.addEventListener('click', (event) => {
+                if (event.target === modalOverlay) {
+                    closeModal();
+                }
+            });
+        }
+
         document.getElementById('burn-checkbox').addEventListener('change', function() {
             if (this.checked) {
                 log('🔥 Burn before close enabled', 'warning');
@@ -2128,6 +2169,7 @@ class WebInterface:
             }
         });
         
+        setupEventListeners();
         refreshAccounts();
         log('Web interface initialized', 'success');
     </script>
