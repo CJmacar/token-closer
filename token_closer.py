@@ -1475,6 +1475,24 @@ class WebInterface:
             color: var(--text-secondary);
         }
         
+        .address-wrap {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .copy-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.8rem;
+            line-height: 1;
+            transition: var(--transition);
+        }
+        
+        .copy-link:hover {
+            color: var(--accent);
+        }
+        
         .log-panel {
             margin-top: 24px;
             background: var(--bg-card);
@@ -1846,13 +1864,21 @@ class WebInterface:
                 const symbolHtml = symbol !== '—' 
                     ? '<a href="' + tokenLink + '" target="_blank" rel="noopener" class="token-link" title="View on Birdeye">' + symbol + '</a>'
                     : symbol;
+                const accountCell = '<span class="address-wrap">' +
+                    '<span>' + truncateAddress(acc.address) + '</span>' +
+                    '<a href="#" class="copy-link" onclick="copyAddress(event, \\'' + acc.address + '\\', \'Account address\')" title="Copy full account address">📋</a>' +
+                    '</span>';
+                const mintCell = '<span class="address-wrap">' +
+                    '<span>' + truncateAddress(acc.mint) + '</span>' +
+                    '<a href="#" class="copy-link" onclick="copyAddress(event, \\'' + acc.mint + '\\', \'Contract address\')" title="Copy full contract address">📋</a>' +
+                    '</span>';
                 return '<tr class="' + (selected ? 'selected' : '') + '" data-address="' + acc.address + '">' +
                     '<td class="checkbox-cell"><input type="checkbox" ' + (selected ? 'checked' : '') + ' onchange="toggleAccount(\\'' + acc.address + '\\')"></td>' +
                     '<td class="symbol">' + symbolHtml + '</td>' +
                     '<td>' + (acc.name || '—') + '</td>' +
                     '<td class="balance">' + acc.balance + '</td>' +
-                    '<td class="address">' + truncateAddress(acc.address) + '</td>' +
-                    '<td class="address">' + truncateAddress(acc.mint) + '</td>' +
+                    '<td class="address">' + accountCell + '</td>' +
+                    '<td class="address">' + mintCell + '</td>' +
                 '</tr>';
             }).join('');
             
@@ -1866,11 +1892,21 @@ class WebInterface:
             return addr;
         }
         
+        async function copyAddress(event, value, label) {
+            event.preventDefault();
+            try {
+                await navigator.clipboard.writeText(value);
+                showToast(label + ' copied', 'success');
+            } catch (err) {
+                showToast('Failed to copy address', 'error');
+            }
+        }
+        
         let metadataFetchInProgress = false;
         
         async function refreshAccounts() {
             log('Refreshing token accounts...', 'info');
-            document.getElementById('accounts-table').innerHTML = '<tr><td colspan="7"><div class="loading"><div class="spinner"></div><span>Loading accounts...</span></div></td></tr>';
+            document.getElementById('accounts-table').innerHTML = '<tr><td colspan="6"><div class="loading"><div class="spinner"></div><span>Loading accounts...</span></div></td></tr>';
             
             try {
                 const response = await fetch('/api/accounts');
